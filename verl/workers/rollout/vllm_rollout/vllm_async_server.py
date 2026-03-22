@@ -398,9 +398,10 @@ class vLLMHttpServer:
             lora_rank = 0
 
         if lora_rank > 0:
+            max_loras = self.model_config.lora.get("max_loras", 1)
             lora_args = {
                 "enable_lora": True,
-                "max_loras": 1,
+                "max_loras": max_loras,
                 "max_lora_rank": get_vllm_max_lora_rank(lora_rank),
             }
             if self.model_config.lora.get("fully_sharded_loras", False):
@@ -632,13 +633,15 @@ class vLLMHttpServer:
         if self.node_rank != 0:
             return
 
+
         # Remove existing adapter for this tenant if present
         loaded_loras = await self.engine.list_loras()
-        if lora_int_id in loaded_loras:
-            await self.engine.collective_rpc(
-                "remove_lora", kwargs={"lora_id": lora_int_id}
-            )
 
+        if lora_int_id in loaded_loras:
+            remove_ret = self.engine.remove_lora(lora_int_id)
+            if inspect.isawaitable(remove_ret):
+                await remove_ret
+            
         # Add the updated adapter
         lora_request = TensorLoRARequest(
             lora_name=str(lora_int_id),
@@ -647,9 +650,13 @@ class vLLMHttpServer:
             peft_config=peft_config,
             lora_tensors=lora_tensors,
         )
-        await self.engine.collective_rpc(
-            "add_lora", kwargs={"lora_request": lora_request}
-        )
+        
+
+        logger.info("[vLLMHttpServer][DEBUG] add_lora via native API")
+        add_ret = self.engine.add_lora(lora_request)
+        if inspect.isawaitable(add_ret):
+            await add_ret
+            
         logger.info(f"[vLLMHttpServer] Added tenant LoRA adapter lora_int_id={lora_int_id}")
 
     async def wake_up(self):

@@ -1,5 +1,7 @@
 #!/bin/bash
 
+ulimit -c 0
+
 # Multi-tenant LoRA training run script
 # Each tenant trains their own LoRA adapter on a shared base model
 
@@ -8,7 +10,9 @@ REPO_ROOT="${REPO_ROOT:-"/users/${USER}/scratch/rl-as-a-service"}"
 MODEL_PATH=${MODEL_PATH:-"${HOME}/models/Qwen2.5-Math-7B"}
 
 # Tenant definitions: comma-separated list of "name:train_file:val_file"
-TENANTS=${TENANTS:-"alice:${HOME}/data/alice_train.parquet:${HOME}/data/alice_val.parquet,bob:${HOME}/data/bob_train.parquet:${HOME}/data/bob_val.parquet"}
+TENANTS=${TENANTS:-"alice:${HOME}/data/dapo-math-17k.parquet:${HOME}/data/aime-2024.parquet,bob:${HOME}/data/dapo-math-17k.parquet:${HOME}/data/aime-2024.parquet"}
+tenant_count=$(echo "${TENANTS}" | awk -F',' '{print NF}')
+max_loras=${MAX_LORAS:-${tenant_count}}
 
 # Naming
 project_name=${PROJECT_NAME:-'MULTI_TENANT_LORA'}
@@ -77,18 +81,20 @@ trigger_parameter_sync_step=${TRIGGER_PARAMETER_SYNC_STEP:-4}
 require_batches=${REQUIRE_BATCHES:-4}
 partial_rollout=${PARTIAL_ROLLOUT:-True}
 
-cd src/verl
+cd "/users/${USER}/scratch/verl"
 
 pip install "numpy==2.1.*"
 
-rm recipe/README.md
-git fetch upstream
-git checkout 016c1d5a7a3f2973d68fda2f7abe5e7df9e05e00
+# rm recipe/README.md
+# git fetch upstream
+# git checkout 016c1d5a7a3f2973d68fda2f7abe5e7df9e05e00
+
 
 python3 "${REPO_ROOT}/lora/patch_vllm_decorators.py"
 
+# Keep literal quotes for Hydra so commas are treated as part of one string value.
 PYTHONUNBUFFERED=1 python -m verl.experimental.fully_async_policy.multi_tenant_main \
-    multi_tenant.tenants="${TENANTS}" \
+    +multi_tenant.tenants="'${TENANTS}'" \
     data.prompt_key=prompt \
     data.truncation='left' \
     data.max_prompt_length=${max_prompt_length} \
@@ -110,6 +116,7 @@ PYTHONUNBUFFERED=1 python -m verl.experimental.fully_async_policy.multi_tenant_m
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.lora_rank=${lora_rank} \
     actor_rollout_ref.model.lora_alpha=${lora_alpha} \
+    +actor_rollout_ref.model.lora.max_loras=${max_loras} \
     actor_rollout_ref.model.target_modules=${lora_target_modules} \
     actor_rollout_ref.hybrid_engine=False \
     +actor_rollout_ref.model.override_config.max_position_embeddings=32768 \

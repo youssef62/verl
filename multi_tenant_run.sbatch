@@ -12,10 +12,10 @@
 #SBATCH --output=logs/multi-tenant/mt_dapo_7b_2tenant_%j.out
 
 
-REPO_ROOT="/users/${USER}/scratch/rl-as-a-service"
+REPO_ROOT="/users/${USER}/scratch/verl"
 
 # Tenant definitions: name:train_file:val_file (comma-separated)
-export TENANTS="alice:${HOME}/data/alice_train.parquet:${HOME}/data/alice_val.parquet,bob:${HOME}/data/bob_train.parquet:${HOME}/data/bob_val.parquet"
+# export TENANTS="alice:${HOME}/data/alice_train.parquet:${HOME}/data/alice_val.parquet,bob:${HOME}/data/bob_train.parquet:${HOME}/data/bob_val.parquet"
 
 # LoRA config (same for all tenants)
 export LORA_RANK=${LORA_RANK:-32}
