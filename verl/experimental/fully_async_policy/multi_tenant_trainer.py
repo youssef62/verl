@@ -216,6 +216,11 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
             return
 
         if self.active_tenant is None:
+            # No active tenant yet (called during startup before init_tenant_adapters_on_rollout).
+            # Still do the base-model NCCL weight sync so vLLM's global_steps is initialized
+            # to a non-None value — otherwise the first generated samples would carry
+            # global_steps=None and crash assemble_batch_from_rollout_samples.
+            await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
             return
 
         tenant_name = self.active_tenant

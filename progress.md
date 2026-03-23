@@ -172,6 +172,12 @@ This is efficient because LoRA adapters are tiny (~50MB for rank-32 on 7B).
   - [verl/workers/rollout/vllm_rollout/vllm_async_server.py](verl/workers/rollout/vllm_rollout/vllm_async_server.py): `add_tenant_lora()` serializes `lora_tensors` with `cloudpickle.dumps()` before staging.
   - [verl/workers/rollout/vllm_rollout/utils.py](verl/workers/rollout/vllm_rollout/utils.py): `stage_lora_tensors()` accepts `lora_tensors_bytes: bytes` and deserializes with `cloudpickle.loads()`.
 
+## 2026-03-23 - Fix `TypeError: unsupported operand type(s) for -: 'NoneType' and 'NoneType'`
+
+- Run logs showed all LoRA adapters loaded, then immediately crashed with `TypeError: unsupported operand type(s) for -: 'NoneType' and 'NoneType'` in `detach_utils.py:197` inside `assemble_batch_from_rollout_samples`.
+- Root cause: `vllm_async_server.py` initializes `self.global_steps = None` and only updates it via `set_global_steps()` (called from `checkpoint_manager.update_weights`). In single-tenant fully async, the pre-fit `_fit_update_weights()` call sets `global_steps = 0` in vLLM before any generation. In multi-tenant, `MultiTenantTrainer._fit_update_weights()` has an extra guard `if self.active_tenant is None: return` — but `active_tenant` is still `None` at that point (it is set later by `init_tenant_adapters_on_rollout` → `_init_tenant_model_states`). So the initial base-model weight sync is skipped entirely, `global_steps` stays `None` in vLLM, and the first generated samples carry `min_global_steps = max_global_steps = None` in `non_tensor_batch`, causing `abs(None - None)` to crash.
+- Fix: in [verl/experimental/fully_async_policy/multi_tenant_trainer.py](verl/experimental/fully_async_policy/multi_tenant_trainer.py), when `active_tenant is None`, still call `checkpoint_manager.update_weights(global_steps=self.current_param_version)` to initialize vLLM's `global_steps`, then return (skipping the LoRA-specific steps that require an active tenant).
+
 ## 2026-03-23 - Fix `fit()` guard: MessageQueue client not set
 
 - Run logs showed both tenant LoRAs loaded successfully, then immediately crashed with `ValueError: MessageQueue client not set. Call set_message_queue_client() first.` at `fully_async_trainer.py:397`.
