@@ -548,6 +548,8 @@ class vLLMHttpServer:
         )
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        # Pop _lora_int_id before constructing SamplingParams (it's not a valid SamplingParams field)
+        request_lora_int_id = sampling_params.pop("_lora_int_id", None)
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
@@ -560,7 +562,6 @@ class vLLMHttpServer:
 
         # Add lora request — support per-request lora_int_id for multi-tenant
         lora_request = None
-        request_lora_int_id = sampling_params.pop("_lora_int_id", None)
         if request_lora_int_id is not None:
             # Multi-tenant: use the per-request lora_int_id
             loaded_loras = await self.engine.list_loras()
