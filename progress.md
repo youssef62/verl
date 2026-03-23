@@ -171,3 +171,10 @@ This is efficient because LoRA adapters are tiny (~50MB for rank-32 on 7B).
 - Changes:
   - [verl/workers/rollout/vllm_rollout/vllm_async_server.py](verl/workers/rollout/vllm_rollout/vllm_async_server.py): `add_tenant_lora()` serializes `lora_tensors` with `cloudpickle.dumps()` before staging.
   - [verl/workers/rollout/vllm_rollout/utils.py](verl/workers/rollout/vllm_rollout/utils.py): `stage_lora_tensors()` accepts `lora_tensors_bytes: bytes` and deserializes with `cloudpickle.loads()`.
+
+## 2026-03-23 - Fix `fit()` guard: MessageQueue client not set
+
+- Run logs showed both tenant LoRAs loaded successfully, then immediately crashed with `ValueError: MessageQueue client not set. Call set_message_queue_client() first.` at `fully_async_trainer.py:397`.
+- Root cause: `FullyAsyncTrainerBase.fit()` checks `self.message_queue_client is None`. `MultiTenantTrainer` overrides `set_message_queue_client()` to a no-op and uses `tenant_queue_clients` instead, but never populates `message_queue_client`, so it stays `None`.
+- Fix: set `self.message_queue_client = True` at the end of `set_tenant_queue_clients()` to satisfy the guard. The base `_get_samples_from_queue()` (which actually uses `message_queue_client`) is fully overridden by multi-tenant, so the sentinel is never accessed.
+- Change: [verl/experimental/fully_async_policy/multi_tenant_trainer.py](verl/experimental/fully_async_policy/multi_tenant_trainer.py): `set_tenant_queue_clients()` sets `self.message_queue_client = True`.

@@ -79,6 +79,9 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
     def set_tenant_queue_clients(self, tenant_queue_clients: dict[str, MessageQueueClient]):
         """Set per-tenant message queue clients."""
         self.tenant_queue_clients = tenant_queue_clients
+        # Satisfy the base-class fit() guard — multi-tenant uses per-tenant queues
+        # instead of a single message_queue_client, but the guard checks is-not-None.
+        self.message_queue_client = True
 
     # Override: not used in multi-tenant mode
     def set_message_queue_client(self, message_queue_client: MessageQueueClient):
