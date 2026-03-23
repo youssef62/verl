@@ -150,3 +150,24 @@ This is efficient because LoRA adapters are tiny (~50MB for rank-32 on 7B).
       - with `inspect.isawaitable(...)` guard so both sync/async return styles are handled.
 - Why this works: it bypasses the `collective_rpc("add_lora", ...)` argument-conversion path where the request was transformed into a list on worker side.
 - Kept complementary capacity fix: `max_loras` is now configurable from `model_config.lora.max_loras` instead of hardcoded `1`.
+
+## 2026-03-23 - Fix TensorLoRARequest downcast via staged tensor cache
+
+- Root cause identified by investigation agent: `engine.add_lora(TensorLoRARequest)` passes through vLLM's internal zmq/msgspec transport (AsyncLLM → EngineCore → workers), which serializes the struct back to plain `LoRARequest` and drops `peft_config`/`lora_tensors`. The hijack then falls back to file loading on `simon_lora_path` → failure.
+- Fix uses a two-step approach:
+  1. **Stage tensors on workers** before `engine.add_lora()`: call `engine.collective_rpc("stage_lora_tensors", args=(lora_int_id, peft_config, lora_tensors))`. This passes plain `(int, dict, dict)` through pickle (no LoRARequest serialization). Each worker stores the tensors in a module-level dict `_staged_lora_tensors` in `verl/utils/vllm/utils.py`.
+  2. **Call `engine.add_lora(plain LoRARequest)`** for engine-level LoRA tracking (needed so `list_loras()` can validate generation requests).
+- Changes:
+  - [verl/utils/vllm/utils.py](verl/utils/vllm/utils.py): Added `_staged_lora_tensors` dict; hijack now checks it as a fallback when `lora_request` is not `TensorLoRARequest`; replaced second `isinstance` check with `lora_tensors is not None`.
+  - [verl/workers/rollout/vllm_rollout/utils.py](verl/workers/rollout/vllm_rollout/utils.py): Added `stage_lora_tensors()` method to `vLLMColocateWorkerExtension`.
+  - [verl/workers/rollout/vllm_rollout/vllm_async_server.py](verl/workers/rollout/vllm_rollout/vllm_async_server.py): `add_tenant_lora()` now stages tensors via `collective_rpc` then calls `engine.add_lora(LoRARequest)` (plain, not TensorLoRARequest).
+
+## 2026-03-23 - Fix tensor list-conversion in staged cache
+
+- New run hit: `AttributeError: 'list' object has no attribute 'to'` in `lora_model.py:101 from_lora_tensors` → `loras[module_name].lora_a = tensor.to(device, dtype)`.
+- Root cause: `engine.collective_rpc` uses zmq+msgspec for IPC. msgspec doesn't support `torch.Tensor` and serializes them via Python's iteration protocol → tensors arrive in the worker as nested Python lists.
+- The staging mechanism itself works (hijack is reached, cache is populated), but tensor values are corrupted.
+- Fix: serialize `lora_tensors` dict to bytes via `cloudpickle.dumps()` before passing to `collective_rpc`; deserialize on the worker side with `cloudpickle.loads()`. `bytes` is a native msgspec type, so it passes through the zmq transport correctly.
+- Changes:
+  - [verl/workers/rollout/vllm_rollout/vllm_async_server.py](verl/workers/rollout/vllm_rollout/vllm_async_server.py): `add_tenant_lora()` serializes `lora_tensors` with `cloudpickle.dumps()` before staging.
+  - [verl/workers/rollout/vllm_rollout/utils.py](verl/workers/rollout/vllm_rollout/utils.py): `stage_lora_tensors()` accepts `lora_tensors_bytes: bytes` and deserializes with `cloudpickle.loads()`.

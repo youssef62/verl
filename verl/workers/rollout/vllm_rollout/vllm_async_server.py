@@ -40,7 +40,6 @@ from verl.utils.device import get_resource_name, get_visible_devices_keyword
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
 from verl.utils.tokenizer import normalize_token_ids
-from verl.utils.vllm import TensorLoRARequest
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
@@ -629,34 +628,45 @@ class vLLMHttpServer:
         """Add or update a tenant's LoRA adapter in the vLLM engine.
 
         Used by multi-tenant training to sync per-tenant adapters to the rollout engine.
+
+        The tensors are staged on each worker via collective_rpc("stage_lora_tensors") before
+        calling engine.add_lora(). This bypasses vLLM's internal msgspec transport, which would
+        downcast TensorLoRARequest → LoRARequest and drop peft_config/lora_tensors.
         """
         if self.node_rank != 0:
             return
 
-
         # Remove existing adapter for this tenant if present
         loaded_loras = await self.engine.list_loras()
-
         if lora_int_id in loaded_loras:
             remove_ret = self.engine.remove_lora(lora_int_id)
             if inspect.isawaitable(remove_ret):
                 await remove_ret
-            
-        # Add the updated adapter
-        lora_request = TensorLoRARequest(
+
+        # Stage tensors on each worker process before engine.add_lora().
+        # collective_rpc uses zmq+msgspec which cannot serialize PyTorch tensors — they
+        # get deserialized as nested lists. Serialize to bytes (cloudpickle) first so
+        # the worker can reconstruct proper tensors from the bytes payload.
+        import cloudpickle
+
+        lora_tensors_bytes = cloudpickle.dumps(lora_tensors)
+        stage_ret = self.engine.collective_rpc(
+            "stage_lora_tensors", args=(lora_int_id, peft_config, lora_tensors_bytes)
+        )
+        if inspect.isawaitable(stage_ret):
+            await stage_ret
+
+        # Now call engine.add_lora() with a plain LoRARequest for engine-level tracking.
+        # The worker's _load_adapter hijack will retrieve the actual tensors from the staged cache.
+        lora_request = LoRARequest(
             lora_name=str(lora_int_id),
             lora_int_id=lora_int_id,
             lora_path=VLLM_LORA_PATH,
-            peft_config=peft_config,
-            lora_tensors=lora_tensors,
         )
-        
-
-        logger.info("[vLLMHttpServer][DEBUG] add_lora via native API")
         add_ret = self.engine.add_lora(lora_request)
         if inspect.isawaitable(add_ret):
             await add_ret
-            
+
         logger.info(f"[vLLMHttpServer] Added tenant LoRA adapter lora_int_id={lora_int_id}")
 
     async def wake_up(self):

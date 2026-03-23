@@ -229,6 +229,22 @@ class vLLMColocateWorkerExtension:
                 logger.info("Loading standard weights (non-FP8, async)")
                 self.model_runner.model.load_weights(weights)
 
+    def stage_lora_tensors(self, lora_int_id: int, peft_config: dict, lora_tensors_bytes: bytes):
+        """Stage LoRA tensors locally so the hijacked _load_adapter can find them.
+
+        Called via collective_rpc before engine.add_lora() to work around the vLLM
+        engine's internal msgspec transport, which cannot serialize PyTorch tensors
+        (they arrive as nested lists). The caller must serialize tensors to bytes via
+        cloudpickle.dumps() before calling this method.
+        """
+        import cloudpickle
+
+        from verl.utils.vllm.utils import _staged_lora_tensors
+
+        lora_tensors = cloudpickle.loads(lora_tensors_bytes)
+        _staged_lora_tensors[lora_int_id] = (peft_config, lora_tensors)
+        logger.info(f"[vLLMColocateWorker] Staged LoRA tensors for lora_int_id={lora_int_id}")
+
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication."""
         if not hasattr(self, "device_uuid") or not self.device_uuid:
