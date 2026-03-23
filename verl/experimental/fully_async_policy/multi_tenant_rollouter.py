@@ -309,16 +309,35 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
                     )
                 return True
 
-        # Check global staleness
-        if self.staleness_samples >= self.max_required_samples:
-            if not self.paused:
-                print(
-                    f"[MTRollouter][ShouldPause] Global staleness: "
-                    f"{self.staleness_samples} >= {self.max_required_samples}"
-                )
-            return True
-
         return False
+
+    async def reset_staleness(self):
+        """Override: sum queue sizes across all tenant queues instead of using message_queue_client."""
+        import time
+
+        async with self.lock:
+            self.paused = False
+            self.condition.notify_all()
+            total_queue_size = sum(
+                client.get_statistics_sync()["queue_size"] for client in self.tenant_queue_clients.values()
+            )
+            self.staleness_samples = len(self.active_tasks) + total_queue_size
+            timing_raw = {}
+            rollout_active_time = self.idle_start_time - self.step_start_time
+            rollout_version_time = time.time() - self.step_start_time
+            idle_ratio = 1 - rollout_active_time / rollout_version_time
+            timing_raw["fully_async/rollouter/active_time"] = rollout_active_time
+            timing_raw["fully_async/rollouter/version_time"] = rollout_version_time
+            timing_raw["fully_async/rollouter/idle_ratio"] = idle_ratio
+
+            print(
+                f"[FullyAsyncRollouter][Public][reset_staleness] "
+                f"reset staleness_samples to: {self.staleness_samples} "
+                f"idle_ratio: {timing_raw['fully_async/rollouter/idle_ratio']:.4f}"
+            )
+            self.step_start_time = time.time()
+        return timing_raw
+
 
     async def get_statistics(self) -> dict:
         """Override: include per-tenant queue stats."""
