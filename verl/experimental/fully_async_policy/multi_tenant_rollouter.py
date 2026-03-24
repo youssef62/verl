@@ -69,6 +69,9 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
         # Per-tenant queue clients (set later by main)
         self.tenant_queue_clients: dict[str, MessageQueueClient] = {}
 
+        # Per-tenant staleness counters (independent of scheduling strategy)
+        self.tenant_staleness_samples: dict[str, int] = {tc.name: 0 for tc in tenant_configs}
+
     def _create_tenant_dataloaders(self, config, tokenizer, processor):
         """Create per-tenant train dataloaders and validation datasets."""
         from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
@@ -131,63 +134,95 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
     async def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         pass  # Not used in multi-tenant mode
 
-    def _create_continuous_tenant_iterator(self):
-        """Create a continuous data iterator that interleaves across tenants and epochs.
+    def _schedule_next_tenants(self, active_tenants: list[TenantConfig]) -> list[TenantConfig]:
+        """Scheduling strategy: return ordered list of tenants to try this round.
 
-        Yields (epoch, tenant_config, batch_dict) tuples, round-robin across tenants.
+        Default is round-robin (preserves order of active_tenants).
+        Override this method to change the scheduling strategy (priority-based,
+        weighted, etc.) without touching staleness or queue-gating logic.
         """
-        for epoch in range(self.config.trainer.total_epochs):
-            # Create iterators for all tenants
-            tenant_iters = {}
-            for tc in self.tenant_configs:
-                tenant_iters[tc.name] = iter(self.tenant_dataloaders[tc.name])
-
-            # Round-robin across tenants until all are exhausted
-            active_tenants = list(self.tenant_configs)
-            while active_tenants:
-                next_active = []
-                for tc in active_tenants:
-                    try:
-                        batch_dict = next(tenant_iters[tc.name])
-                        yield epoch, tc, batch_dict
-                    except StopIteration:
-                        print(f"[MTRollouter] Tenant '{tc.name}' exhausted in epoch {epoch}")
-                        continue
-                    next_active.append(tc)
-                active_tenants = next_active
+        return list(active_tenants)
 
     async def _feed_samples(self):
-        """Override: feed samples from all tenants, tagged with tenant_id and lora_int_id."""
-        tenant_iterator = self._create_continuous_tenant_iterator()
+        """Override: feed samples with per-tenant staleness and queue-fullness gating.
 
-        for epoch, tc, batch_dict in tenant_iterator:
-            full_batch = prepare_single_generation_data(batch_dict, self.config)
+        Key properties:
+        - Scheduling is delegated to _schedule_next_tenants() (overrideable)
+        - Staleness and queue-full checks are per-tenant and independent
+        - Dataloader is only advanced when a tenant passes all gates (no data waste)
+        - When all tenants are gated, waits on condition variable for reset/drain signal
+        """
+        for epoch in range(self.config.trainer.total_epochs):
+            tenant_iters = {tc.name: iter(self.tenant_dataloaders[tc.name]) for tc in self.tenant_configs}
+            active_tenants = list(self.tenant_configs)
 
-            # Tag the DataProto with tenant's lora_int_id for multi-LoRA generation
-            full_batch.meta_info["_lora_int_id"] = tc.lora_int_id
+            while active_tenants:
+                scheduled = self._schedule_next_tenants(active_tenants)
+                made_progress = False
+                next_active = []
 
-            sample_id = f"sample_{tc.name}_{epoch}_{self.global_steps}"
+                for tc in scheduled:
+                    # Per-tenant staleness gate: skip without advancing the dataloader
+                    if (self.max_required_samples is not None and
+                            self.tenant_staleness_samples.get(tc.name, 0) >= self.max_required_samples):
+                        next_active.append(tc)
+                        continue
 
-            rollout_sample = RolloutSample(
-                full_batch=full_batch,
-                sample_id=sample_id,
-                epoch=epoch,
-                rollout_status={},
-                tenant_id=tc.name,
-            )
+                    # Per-tenant queue-full gate: skip without advancing the dataloader
+                    if self.max_queue_size is not None and self.tenant_queue_clients:
+                        queue_size = self.tenant_queue_clients[tc.name].get_statistics_sync()["queue_size"]
+                        if queue_size >= self.max_queue_size:
+                            next_active.append(tc)
+                            continue
 
-            await self.pending_queue.put(rollout_sample)
+                    # All gates passed — pull next batch (dataloader only advanced here)
+                    try:
+                        batch_dict = next(tenant_iters[tc.name])
+                    except StopIteration:
+                        print(f"[MTRollouter] Tenant '{tc.name}' exhausted in epoch {epoch}")
+                        continue  # exhausted: not added to next_active
 
-            if self.global_steps >= self.total_rollout_steps:
-                print(
-                    f"[MTRollouter][Feed] Maximum count reached, stopping: "
-                    f"{self.global_steps} >= {self.total_rollout_steps}"
-                )
-                break
+                    next_active.append(tc)
 
-            self.global_steps += 1
+                    full_batch = prepare_single_generation_data(batch_dict, self.config)
+                    full_batch.meta_info["_lora_int_id"] = tc.lora_int_id
+                    sample_id = f"sample_{tc.name}_{epoch}_{self.global_steps}"
+                    rollout_sample = RolloutSample(
+                        full_batch=full_batch,
+                        sample_id=sample_id,
+                        epoch=epoch,
+                        rollout_status={},
+                        tenant_id=tc.name,
+                    )
 
-        # End signal
+                    await self.pending_queue.put(rollout_sample)
+                    self.tenant_staleness_samples[tc.name] = self.tenant_staleness_samples.get(tc.name, 0) + 1
+                    made_progress = True
+
+                    if self.global_steps >= self.total_rollout_steps:
+                        print(
+                            f"[MTRollouter][Feed] Maximum count reached, stopping: "
+                            f"{self.global_steps} >= {self.total_rollout_steps}"
+                        )
+                        await self.pending_queue.put(None)
+                        print(f"[MTRollouter][Feed] Sample addition complete, {self.global_steps} samples added")
+                        return
+
+                    self.global_steps += 1
+
+                active_tenants = next_active
+
+                # No tenant made progress this round — all are gated.
+                # Wait for a staleness reset or queue drain signal.
+                if not made_progress and active_tenants:
+                    async with self.lock:
+                        print(
+                            f"[MTRollouter][Feed] All active tenants gated this round, waiting. "
+                            f"staleness={dict(self.tenant_staleness_samples)}"
+                        )
+                        await self.condition.wait()
+
+        # All epochs exhausted
         await self.pending_queue.put(None)
         print(f"[MTRollouter][Feed] Sample addition complete, {self.global_steps} samples added")
 
@@ -296,32 +331,65 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
             self.running = False
 
     async def _should_pause_generation(self) -> bool:
-        """Override: check ALL tenant queues for fullness."""
-        # Check if any tenant queue is full
-        for name, client in self.tenant_queue_clients.items():
-            queue_stats = client.get_statistics_sync()
-            queue_size = queue_stats["queue_size"]
-            if queue_size >= self.max_queue_size:
-                if not self.paused:
-                    print(
-                        f"[MTRollouter][ShouldPause] Tenant '{name}' queue full: "
-                        f"size={queue_size}, max={self.max_queue_size}"
-                    )
-                return True
+        """Override: pause the processor only when ALL tenant queues are full.
+
+        Per-tenant staleness and per-tenant queue-fullness are handled upstream in
+        _feed_samples (gates before pulling from the dataloader).  Pausing here only
+        when *every* queue is full avoids wasting generation capacity on samples that
+        would be dropped, while letting tenants with room continue unimpeded.
+        """
+        if not self.tenant_queue_clients or self.max_queue_size is None:
+            return False
+
+        all_full = all(
+            client.get_statistics_sync()["queue_size"] >= self.max_queue_size
+            for client in self.tenant_queue_clients.values()
+        )
+        if all_full:
+            if not self.paused:
+                print(
+                    f"[MTRollouter][ShouldPause] All tenant queues full "
+                    f"(max={self.max_queue_size}), pausing processor"
+                )
+            return True
 
         return False
 
-    async def reset_staleness(self):
-        """Override: sum queue sizes across all tenant queues instead of using message_queue_client."""
+    async def reset_staleness(self, tenant_id: str | None = None):
+        """Override: reset per-tenant staleness counter(s) and update global counter.
+
+        Args:
+            tenant_id: If given, reset only that tenant's counter to its current queue
+                       size (called after the trainer syncs that tenant's parameters).
+                       If None, reset all tenants (backward-compatible).
+
+        The condition is notified so any _feed_samples coroutine waiting on this tenant
+        wakes up and re-evaluates whether it can proceed.
+        """
         import time
 
         async with self.lock:
             self.paused = False
             self.condition.notify_all()
+
+            if tenant_id is not None:
+                # Reset only the specified tenant's per-tenant counter
+                client = self.tenant_queue_clients[tenant_id]
+                queue_size = client.get_statistics_sync()["queue_size"]
+                self.tenant_staleness_samples[tenant_id] = queue_size
+            else:
+                # Reset all tenants (backward-compatible path)
+                for tc in self.tenant_configs:
+                    client = self.tenant_queue_clients[tc.name]
+                    queue_size = client.get_statistics_sync()["queue_size"]
+                    self.tenant_staleness_samples[tc.name] = queue_size
+
+            # Keep global staleness_samples consistent
             total_queue_size = sum(
                 client.get_statistics_sync()["queue_size"] for client in self.tenant_queue_clients.values()
             )
             self.staleness_samples = len(self.active_tasks) + total_queue_size
+
             timing_raw = {}
             rollout_active_time = self.idle_start_time - self.step_start_time
             rollout_version_time = time.time() - self.step_start_time
@@ -331,8 +399,9 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
             timing_raw["fully_async/rollouter/idle_ratio"] = idle_ratio
 
             print(
-                f"[FullyAsyncRollouter][Public][reset_staleness] "
+                f"[MTRollouter][Public][reset_staleness] tenant_id={tenant_id!r} "
                 f"reset staleness_samples to: {self.staleness_samples} "
+                f"tenant_staleness={dict(self.tenant_staleness_samples)} "
                 f"idle_ratio: {timing_raw['fully_async/rollouter/idle_ratio']:.4f}"
             )
             self.step_start_time = time.time()
@@ -357,5 +426,8 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
         for name, client in self.tenant_queue_clients.items():
             queue_stats = client.get_statistics_sync()
             stats[f"monitor/queue/{name}_queue_size"] = queue_stats["queue_size"]
+
+        for tc in self.tenant_configs:
+            stats[f"count/staleness_{tc.name}"] = self.tenant_staleness_samples.get(tc.name, 0)
 
         return stats

@@ -184,3 +184,12 @@ This is efficient because LoRA adapters are tiny (~50MB for rank-32 on 7B).
 - Root cause: `FullyAsyncTrainerBase.fit()` checks `self.message_queue_client is None`. `MultiTenantTrainer` overrides `set_message_queue_client()` to a no-op and uses `tenant_queue_clients` instead, but never populates `message_queue_client`, so it stays `None`.
 - Fix: set `self.message_queue_client = True` at the end of `set_tenant_queue_clients()` to satisfy the guard. The base `_get_samples_from_queue()` (which actually uses `message_queue_client`) is fully overridden by multi-tenant, so the sentinel is never accessed.
 - Change: [verl/experimental/fully_async_policy/multi_tenant_trainer.py](verl/experimental/fully_async_policy/multi_tenant_trainer.py): `set_tenant_queue_clients()` sets `self.message_queue_client = True`.
+
+## 2026-03-24 - Per-tenant staleness limit
+
+- Added per-tenant staleness tracking (`tenant_staleness_samples` dict) in `MultiTenantRollouter`.
+- Rewrote `_feed_samples` with per-tenant staleness and queue-full gates checked **before** advancing the dataloader — no data waste when a tenant is skipped. Scheduling is delegated to `_schedule_next_tenants()` (new overrideable hook, default round-robin), fully decoupled from the gating logic.
+- When all tenants are gated in a round, `_feed_samples` waits on the condition variable; `reset_staleness` notifies to unblock.
+- `_should_pause_generation` now pauses the processor only when **all** tenant queues are full (previously paused if any single queue was full). Per-tenant staleness gating lives entirely in `_feed_samples`.
+- `reset_staleness(tenant_id=None)` accepts an optional `tenant_id`; when provided, only that tenant's counter is reset (to its current queue size). Trainer now passes `tenant_name` on each adapter sync.
+- Changes: [verl/experimental/fully_async_policy/multi_tenant_rollouter.py](verl/experimental/fully_async_policy/multi_tenant_rollouter.py), [verl/experimental/fully_async_policy/multi_tenant_trainer.py](verl/experimental/fully_async_policy/multi_tenant_trainer.py).

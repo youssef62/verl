@@ -243,7 +243,7 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         self.tenant_param_versions[tenant_name] = self.current_param_version
 
         # Reset staleness in rollouter
-        timing_raw = ray.get(self.rollouter.reset_staleness.remote())
+        timing_raw = ray.get(self.rollouter.reset_staleness.remote(tenant_name))
         self.logger.log(data=timing_raw, step=self.current_param_version)
 
         # Log aggregated training metrics with tenant info
