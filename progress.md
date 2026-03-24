@@ -193,3 +193,12 @@ This is efficient because LoRA adapters are tiny (~50MB for rank-32 on 7B).
 - `_should_pause_generation` now pauses the processor only when **all** tenant queues are full (previously paused if any single queue was full). Per-tenant staleness gating lives entirely in `_feed_samples`.
 - `reset_staleness(tenant_id=None)` accepts an optional `tenant_id`; when provided, only that tenant's counter is reset (to its current queue size). Trainer now passes `tenant_name` on each adapter sync.
 - Changes: [verl/experimental/fully_async_policy/multi_tenant_rollouter.py](verl/experimental/fully_async_policy/multi_tenant_rollouter.py), [verl/experimental/fully_async_policy/multi_tenant_trainer.py](verl/experimental/fully_async_policy/multi_tenant_trainer.py).
+
+## 2026-03-24 - Per-tenant step counters in log
+
+- `global_steps` and `local_trigger_step` were shared across all tenants in the base class — both incremented on every `fit_step()` regardless of tenant, so with 2 tenants they doubled at the same rate.
+- Added `tenant_global_steps` and `tenant_local_trigger_steps` dicts (initialized to `1` per tenant) in `MultiTenantTrainer.__init__`.
+- Overrode `_fit_update_local_step()`: restores the current tenant's counters into the shared base-class fields before logging and advancing them; prints `[FullyAsyncTrainer][tenant=<name>]` prefix so each log line is attributed to the correct tenant.
+- Overrode `_fit_postprocess_step()`: increments per-tenant `global_steps` rather than the shared counter.
+- Result: log now shows `[FullyAsyncTrainer][tenant=alice] global_steps: 1 local_trigger_step: 1 ...` and `[FullyAsyncTrainer][tenant=bob] global_steps: 1 local_trigger_step: 1 ...` independently.
+- Change: [verl/experimental/fully_async_policy/multi_tenant_trainer.py](verl/experimental/fully_async_policy/multi_tenant_trainer.py).

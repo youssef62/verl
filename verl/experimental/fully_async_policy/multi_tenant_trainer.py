@@ -8,6 +8,7 @@ to vLLM replicas.
 import logging
 import os
 import time
+from datetime import datetime
 from typing import Any
 
 import ray
@@ -59,6 +60,10 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
 
         # Per-tenant training state (param versions, step counters)
         self.tenant_param_versions: dict[str, int] = {tc.name: 0 for tc in tenant_configs}
+
+        # Per-tenant step counters (independent of other tenants)
+        self.tenant_global_steps: dict[str, int] = {tc.name: 1 for tc in tenant_configs}
+        self.tenant_local_trigger_steps: dict[str, int] = {tc.name: 1 for tc in tenant_configs}
 
         # Track which tenant was last trained (for metrics)
         self.last_trained_tenant: str | None = None
@@ -309,6 +314,47 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
             ray.get(sync_futures)
 
         print(f"[MTTrainer] All {len(self.tenant_configs)} tenant LoRA adapters initialized on vLLM")
+
+    def _fit_update_local_step(self):
+        """Override: per-tenant local_trigger_step and global_steps tracking."""
+        tenant_name = self.active_tenant or "unknown"
+
+        # Restore this tenant's counters into the shared base-class fields so that
+        # _fit_update_weights / _fit_validate (which check self.local_trigger_step)
+        # see the correct per-tenant value.
+        self.local_trigger_step = self.tenant_local_trigger_steps.get(tenant_name, 1)
+        self.global_steps = self.tenant_global_steps.get(tenant_name, 1)
+
+        time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        print(
+            f"[FullyAsyncTrainer][tenant={tenant_name}] global_steps: {self.global_steps} "
+            f"local_trigger_step: {self.local_trigger_step} "
+            f"trigger_parameter_sync_step: {self.trigger_parameter_sync_step} "
+            f"{time_str}"
+        )
+
+        if self.local_trigger_step < self.trigger_parameter_sync_step:
+            self.local_trigger_step += 1
+        else:
+            self.current_param_version += 1
+            self.local_trigger_step = 1
+
+        self.tenant_local_trigger_steps[tenant_name] = self.local_trigger_step
+
+    def _fit_postprocess_step(self):
+        """Override: increment per-tenant global_steps instead of shared counter."""
+        tenant_name = self.active_tenant or "unknown"
+        if tenant_name in self.tenant_global_steps:
+            self.tenant_global_steps[tenant_name] += 1
+            self.global_steps = self.tenant_global_steps[tenant_name]
+        else:
+            self.global_steps += 1
+
+        self.metrics_aggregator.add_step_metrics(
+            metrics=self.metrics, sample_count=self.required_samples, timestamp=time.time()
+        )
+        if self.local_trigger_step == 1:
+            self.progress_bar.update(1)
 
     def _collect_metrics_from_samples(self, batch, metrics):
         """Override: add tenant info to metrics."""
