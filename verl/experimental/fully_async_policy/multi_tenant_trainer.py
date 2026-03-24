@@ -274,22 +274,18 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
             f"current_param_version: {self.current_param_version}"
         )
 
-        # Update tenant-specific param version
-        self.tenant_param_versions[tenant_name] = self.current_param_version
-
         # Reset staleness in rollouter
         timing_raw = ray.get(self.rollouter.reset_staleness.remote(tenant_name))
         self.logger.log(data=timing_raw, step=self.current_param_version)
 
-        # Log aggregated training metrics from the per-tenant aggregator, at the
-        # per-tenant step so each tenant's curves are independent in the tracker.
-        tenant_step = self.tenant_global_steps.get(tenant_name, self.current_param_version)
+        # Log aggregated training metrics from the per-tenant aggregator.
+        # current_param_version is already per-tenant (set in _fit_update_local_step).
         tenant_agg = self.tenant_metrics_aggregators.get(tenant_name)
         if tenant_agg is not None:
             agg_metrics = tenant_agg.get_aggregated_metrics()
             # Keys are already prefixed (e.g. "alice/actor/loss") from _fit_postprocess_step
             agg_metrics[f"{tenant_name}/fully_async/active_tenant_lora_id"] = lora_int_id
-            self.logger.log(data=agg_metrics, step=tenant_step)
+            self.logger.log(data=agg_metrics, step=self.current_param_version)
             tenant_agg.reset()
         else:
             # Fallback before set_total_train_steps is called
@@ -360,16 +356,19 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         """Override: per-tenant local_trigger_step and global_steps tracking."""
         tenant_name = self.active_tenant or "unknown"
 
-        # Restore this tenant's counters into the shared base-class fields so that
-        # _fit_update_weights / _fit_validate (which check self.local_trigger_step)
-        # see the correct per-tenant value.
+        # Restore all per-tenant counters into the shared base-class fields so that
+        # _fit_update_weights / _fit_validate (which check these fields) see the correct
+        # per-tenant values.  tenant_param_versions / tenant_local_trigger_steps /
+        # tenant_global_steps are the backing stores across tenant switches.
         self.local_trigger_step = self.tenant_local_trigger_steps.get(tenant_name, 1)
         self.global_steps = self.tenant_global_steps.get(tenant_name, 1)
+        self.current_param_version = self.tenant_param_versions.get(tenant_name, 0)
 
         time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         print(
             f"[FullyAsyncTrainer][tenant={tenant_name}] global_steps: {self.global_steps} "
             f"local_trigger_step: {self.local_trigger_step} "
+            f"current_param_version: {self.current_param_version} "
             f"trigger_parameter_sync_step: {self.trigger_parameter_sync_step} "
             f"{time_str}"
         )
@@ -381,6 +380,7 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
             self.local_trigger_step = 1
 
         self.tenant_local_trigger_steps[tenant_name] = self.local_trigger_step
+        self.tenant_param_versions[tenant_name] = self.current_param_version
 
     def _fit_postprocess_step(self):
         """Override: per-tenant global_steps, per-tenant aggregator and progress bar."""

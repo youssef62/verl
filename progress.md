@@ -185,6 +185,13 @@ This is efficient because LoRA adapters are tiny (~50MB for rank-32 on 7B).
 - Fix: set `self.message_queue_client = True` at the end of `set_tenant_queue_clients()` to satisfy the guard. The base `_get_samples_from_queue()` (which actually uses `message_queue_client`) is fully overridden by multi-tenant, so the sentinel is never accessed.
 - Change: [verl/experimental/fully_async_policy/multi_tenant_trainer.py](verl/experimental/fully_async_policy/multi_tenant_trainer.py): `set_tenant_queue_clients()` sets `self.message_queue_client = True`.
 
+## 2026-03-24 - Per-tenant current_param_version
+
+- `current_param_version` is now per-tenant: loaded from `tenant_param_versions[tenant_name]` at the top of `_fit_update_local_step` and saved back after the update — same pattern as `local_trigger_step` and `global_steps`.
+- Removed the redundant `self.tenant_param_versions[tenant_name] = self.current_param_version` write from `_fit_update_weights` (now handled by `_fit_update_local_step`).
+- Removed the `tenant_step` indirection in `_fit_update_weights`; all logging uses `self.current_param_version` directly since it is already per-tenant.
+- Change: [verl/experimental/fully_async_policy/multi_tenant_trainer.py](verl/experimental/fully_async_policy/multi_tenant_trainer.py).
+
 ## 2026-03-24 - Per-tenant staleness limit
 
 - Added per-tenant staleness tracking (`tenant_staleness_samples` dict) in `MultiTenantRollouter`.
