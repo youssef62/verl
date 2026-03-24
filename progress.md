@@ -194,6 +194,16 @@ This is efficient because LoRA adapters are tiny (~50MB for rank-32 on 7B).
 - `reset_staleness(tenant_id=None)` accepts an optional `tenant_id`; when provided, only that tenant's counter is reset (to its current queue size). Trainer now passes `tenant_name` on each adapter sync.
 - Changes: [verl/experimental/fully_async_policy/multi_tenant_rollouter.py](verl/experimental/fully_async_policy/multi_tenant_rollouter.py), [verl/experimental/fully_async_policy/multi_tenant_trainer.py](verl/experimental/fully_async_policy/multi_tenant_trainer.py).
 
+## 2026-03-24 - Per-tenant progress bars and metrics
+
+- Added per-tenant `tqdm` progress bars (one per tenant, `position=i+1`; position 0 is the shared global bar which is no longer ticked in multi-tenant mode to avoid overshooting).
+- Each tenant bar has `total=total_training_steps` — tenants train **independently** for the full budget, not sharing it.
+- Added per-tenant `MetricsAggregator` instances created in `set_total_train_steps`.
+- `_fit_postprocess_step` feeds the per-tenant aggregator with tenant-prefixed keys (e.g. `alice/actor/loss`, `bob/actor/loss`), keeping each tenant's curves independent in the tracker.
+- `_fit_update_weights` logs from the per-tenant aggregator at `tenant_global_steps` (per-tenant x-axis), not `current_param_version`.
+- `fit()` closes per-tenant bars on training completion.
+- Change: [verl/experimental/fully_async_policy/multi_tenant_trainer.py](verl/experimental/fully_async_policy/multi_tenant_trainer.py).
+
 ## 2026-03-24 - Per-tenant step counters in log
 
 - `global_steps` and `local_trigger_step` were shared across all tenants in the base class — both incremented on every `fit_step()` regardless of tenant, so with 2 tenants they doubled at the same rate.

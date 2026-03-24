@@ -14,7 +14,10 @@ from typing import Any
 import ray
 from omegaconf import OmegaConf
 
+from tqdm import tqdm
+
 from verl.experimental.fully_async_policy.detach_utils import (
+    MetricsAggregator,
     TenantConfig,
     assemble_batch_from_rollout_samples,
 )
@@ -65,6 +68,10 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         self.tenant_global_steps: dict[str, int] = {tc.name: 1 for tc in tenant_configs}
         self.tenant_local_trigger_steps: dict[str, int] = {tc.name: 1 for tc in tenant_configs}
 
+        # Per-tenant progress bars and metrics aggregators (created in set_total_train_steps)
+        self.tenant_progress_bars: dict[str, tqdm] = {}
+        self.tenant_metrics_aggregators: dict[str, MetricsAggregator] = {}
+
         # Track which tenant was last trained (for metrics)
         self.last_trained_tenant: str | None = None
 
@@ -81,6 +88,12 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
             device_name=device_name,
         )
 
+    async def fit(self):
+        """Override: close per-tenant progress bars after training completes."""
+        await super().fit()
+        for bar in self.tenant_progress_bars.values():
+            bar.close()
+
     def set_tenant_queue_clients(self, tenant_queue_clients: dict[str, MessageQueueClient]):
         """Set per-tenant message queue clients."""
         self.tenant_queue_clients = tenant_queue_clients
@@ -91,6 +104,23 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
     # Override: not used in multi-tenant mode
     def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         pass
+
+    def set_total_train_steps(self, total_training_steps: int):
+        """Override: create per-tenant progress bars and metrics aggregators."""
+        super().set_total_train_steps(total_training_steps)
+
+        per_tenant_steps = total_training_steps  # each tenant trains independently for this many steps
+        total_gpus = self.metrics_aggregator.total_gpus  # reuse value set by base class
+
+        for i, tc in enumerate(self.tenant_configs):
+            self.tenant_progress_bars[tc.name] = tqdm(
+                total=per_tenant_steps,
+                initial=0,
+                desc=f"[{tc.name}]",
+                position=i + 1,  # position 0 is the shared global bar
+                leave=True,
+            )
+            self.tenant_metrics_aggregators[tc.name] = MetricsAggregator(total_gpus=total_gpus)
 
     def _tenant_version_key(self, tenant_name: str) -> int:
         """Get a unique version key for save/restore_model_to/from_cpu."""
@@ -251,11 +281,22 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         timing_raw = ray.get(self.rollouter.reset_staleness.remote(tenant_name))
         self.logger.log(data=timing_raw, step=self.current_param_version)
 
-        # Log aggregated training metrics with tenant info
-        agg_metrics = self.metrics_aggregator.get_aggregated_metrics()
-        agg_metrics["fully_async/active_tenant_lora_id"] = lora_int_id
-        self.logger.log(data=agg_metrics, step=self.current_param_version)
-        self.metrics_aggregator.reset()
+        # Log aggregated training metrics from the per-tenant aggregator, at the
+        # per-tenant step so each tenant's curves are independent in the tracker.
+        tenant_step = self.tenant_global_steps.get(tenant_name, self.current_param_version)
+        tenant_agg = self.tenant_metrics_aggregators.get(tenant_name)
+        if tenant_agg is not None:
+            agg_metrics = tenant_agg.get_aggregated_metrics()
+            # Keys are already prefixed (e.g. "alice/actor/loss") from _fit_postprocess_step
+            agg_metrics[f"{tenant_name}/fully_async/active_tenant_lora_id"] = lora_int_id
+            self.logger.log(data=agg_metrics, step=tenant_step)
+            tenant_agg.reset()
+        else:
+            # Fallback before set_total_train_steps is called
+            agg_metrics = self.metrics_aggregator.get_aggregated_metrics()
+            agg_metrics["fully_async/active_tenant_lora_id"] = lora_int_id
+            self.logger.log(data=agg_metrics, step=self.current_param_version)
+            self.metrics_aggregator.reset()
 
     async def _sync_tenant_lora_to_rollout(self, tenant_name: str):
         """Extract the current LoRA adapter and send it to vLLM replicas for this tenant."""
@@ -342,7 +383,7 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         self.tenant_local_trigger_steps[tenant_name] = self.local_trigger_step
 
     def _fit_postprocess_step(self):
-        """Override: increment per-tenant global_steps instead of shared counter."""
+        """Override: per-tenant global_steps, per-tenant aggregator and progress bar."""
         tenant_name = self.active_tenant or "unknown"
         if tenant_name in self.tenant_global_steps:
             self.tenant_global_steps[tenant_name] += 1
@@ -350,11 +391,26 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         else:
             self.global_steps += 1
 
-        self.metrics_aggregator.add_step_metrics(
-            metrics=self.metrics, sample_count=self.required_samples, timestamp=time.time()
-        )
+        # Add to the per-tenant aggregator with a tenant-name prefix on every metric key.
+        # This keeps alice's loss/actor separate from bob's in the logs.
+        tenant_agg = self.tenant_metrics_aggregators.get(tenant_name)
+        if tenant_agg is not None:
+            prefixed = {f"{tenant_name}/{k}": v for k, v in self.metrics.items()}
+            tenant_agg.add_step_metrics(
+                metrics=prefixed, sample_count=self.required_samples, timestamp=time.time()
+            )
+        else:
+            # Fallback before set_total_train_steps is called
+            self.metrics_aggregator.add_step_metrics(
+                metrics=self.metrics, sample_count=self.required_samples, timestamp=time.time()
+            )
+
         if self.local_trigger_step == 1:
-            self.progress_bar.update(1)
+            # Advance only the per-tenant bar — the shared global bar is not updated
+            # because with N tenants it would receive N ticks per round and overshoot.
+            bar = self.tenant_progress_bars.get(tenant_name)
+            if bar is not None:
+                bar.update(1)
 
     def _collect_metrics_from_samples(self, batch, metrics):
         """Override: add tenant info to metrics."""
