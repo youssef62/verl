@@ -11,12 +11,14 @@ import time
 from datetime import datetime
 from typing import Any
 
+import numpy as np
 import ray
 from omegaconf import OmegaConf
 
 from verl.experimental.fully_async_policy.detach_utils import (
     TenantConfig,
     assemble_batch_from_rollout_samples,
+    is_system_metric,
 )
 from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainerBase, TrainingStopException
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
@@ -80,6 +82,21 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
             processor=processor,
             device_name=device_name,
         )
+
+        # Per-tenant aggregators for data metrics (losses, scores, staleness, etc.)
+        # The parent's self.metrics_aggregator is no longer used in multi-tenant mode.
+        from verl.experimental.fully_async_policy.detach_utils import MetricsAggregator
+
+        total_gpus = (
+            config.trainer.nnodes * config.trainer.n_gpus_per_node
+            + config.rollout.nnodes * config.rollout.n_gpus_per_node
+        )
+        self.tenant_metrics_aggregators: dict[str, MetricsAggregator] = {
+            tc.name: MetricsAggregator(total_gpus=total_gpus) for tc in tenant_configs
+        }
+
+        # Shared step counter across all tenants (monotonic, for system timing x-axis)
+        self.total_fit_steps = 0
 
     def set_tenant_queue_clients(self, tenant_queue_clients: dict[str, MessageQueueClient]):
         """Set per-tenant message queue clients."""
@@ -247,15 +264,18 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         # Update tenant-specific param version
         self.tenant_param_versions[tenant_name] = self.current_param_version
 
-        # Reset staleness in rollouter
+        # Rollouter staleness metrics (system-level, logged at current_param_version)
         timing_raw = ray.get(self.rollouter.reset_staleness.remote(tenant_name))
         self.logger.log(data=timing_raw, step=self.current_param_version)
 
-        # Log aggregated training metrics with tenant info
-        agg_metrics = self.metrics_aggregator.get_aggregated_metrics()
-        agg_metrics["fully_async/active_tenant_lora_id"] = lora_int_id
-        self.logger.log(data=agg_metrics, step=self.current_param_version)
-        self.metrics_aggregator.reset()
+        # Per-tenant data metrics: flush aggregator, prefix with tenant name,
+        # log at this tenant's global_steps
+        if tenant_name in self.tenant_metrics_aggregators:
+            tenant_agg = self.tenant_metrics_aggregators[tenant_name].get_aggregated_metrics()
+            prefixed = {f"{tenant_name}/{k}": v for k, v in tenant_agg.items()}
+            prefixed[f"{tenant_name}/active_tenant_lora_id"] = lora_int_id
+            self.logger.log(data=prefixed, step=self.tenant_global_steps[tenant_name])
+            self.tenant_metrics_aggregators[tenant_name].reset()
 
     async def _sync_tenant_lora_to_rollout(self, tenant_name: str):
         """Extract the current LoRA adapter and send it to vLLM replicas for this tenant."""
@@ -342,17 +362,52 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         self.tenant_local_trigger_steps[tenant_name] = self.local_trigger_step
 
     def _fit_postprocess_step(self):
-        """Override: increment per-tenant global_steps instead of shared counter."""
+        """Override: split metrics into system (timing) and per-tenant (data).
+
+        System metrics (timing_s/*, perf/*) are logged every step at total_fit_steps.
+        Per-tenant data metrics (critic/*, actor/*, staleness) go to per-tenant aggregators,
+        flushed when that tenant hits param_sync in _fit_update_weights.
+        """
         tenant_name = self.active_tenant or "unknown"
+        self.total_fit_steps += 1
+
+        # Split metrics into system (timing/perf) vs per-tenant (data)
+        system_metrics = {}
+        tenant_data_metrics = {}
+        for key, value in self.metrics.items():
+            if not isinstance(value, (int, float, np.number)):
+                continue  # skip string metrics like active_tenant
+            if is_system_metric(key):
+                system_metrics[key] = value
+            else:
+                tenant_data_metrics[key] = value
+
+        # Compute idle_ratio inline (previously done by MetricsAggregator._special_metrics_aggregate)
+        if "timing_s/gen" in system_metrics and "timing_s/step" in system_metrics:
+            step_time = system_metrics["timing_s/step"]
+            if step_time > 0:
+                system_metrics["fully_async/trainer/idle_ratio"] = (
+                    system_metrics["timing_s/gen"] / step_time
+                )
+
+        # Log system timing metrics immediately (every step, no aggregation)
+        self.logger.log(data=system_metrics, step=self.total_fit_steps)
+
+        # Route data metrics to per-tenant aggregator
+        if tenant_name in self.tenant_metrics_aggregators:
+            self.tenant_metrics_aggregators[tenant_name].add_step_metrics(
+                metrics=tenant_data_metrics,
+                sample_count=self.required_samples,
+                timestamp=time.time(),
+            )
+
+        # Increment per-tenant global_steps
         if tenant_name in self.tenant_global_steps:
             self.tenant_global_steps[tenant_name] += 1
             self.global_steps = self.tenant_global_steps[tenant_name]
         else:
             self.global_steps += 1
 
-        self.metrics_aggregator.add_step_metrics(
-            metrics=self.metrics, sample_count=self.required_samples, timestamp=time.time()
-        )
         if self.local_trigger_step == 1:
             self.progress_bar.update(1)
 

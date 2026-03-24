@@ -24,6 +24,15 @@ from verl import DataProto
 from verl.trainer.ppo.ray_trainer import compute_response_mask
 
 
+_SYSTEM_METRIC_PREFIXES = ("timing_s/", "timing_per_token_ms/", "perf/")
+_SYSTEM_METRIC_EXACT = {"fully_async/total_wait_time"}
+
+
+def is_system_metric(key: str) -> bool:
+    """Returns True for timing/perf metrics that should be logged per-step (system-level)."""
+    return any(key.startswith(p) for p in _SYSTEM_METRIC_PREFIXES) or key in _SYSTEM_METRIC_EXACT
+
+
 @dataclass
 class TenantConfig:
     """Configuration for a single tenant in multi-tenant training"""
