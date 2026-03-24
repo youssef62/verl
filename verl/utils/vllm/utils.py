@@ -74,7 +74,9 @@ class VLLMHijack:
                     # Multi-tenant path: tensors staged via collective_rpc("stage_lora_tensors")
                     # before engine.add_lora() was called. Engine serialization downcasts
                     # TensorLoRARequest → LoRARequest, so we retrieve tensors from local cache.
-                    peft_config, lora_tensors = _staged_lora_tensors.pop(lora_request.lora_int_id)
+                    # Do NOT pop — vLLM's LRU cache may evict and reload the adapter, requiring
+                    # a second call to _load_adapter with the same lora_int_id.
+                    peft_config, lora_tensors = _staged_lora_tensors[lora_request.lora_int_id]
                     peft_helper = PEFTHelper.from_dict(peft_config)
                 else:
                     lora_path = get_adapter_absolute_path(lora_request.lora_path)

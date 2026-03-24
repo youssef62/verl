@@ -637,17 +637,16 @@ class vLLMHttpServer:
         if self.node_rank != 0:
             return
 
-        # Remove existing adapter for this tenant if present
-        loaded_loras = await self.engine.list_loras()
-        if lora_int_id in loaded_loras:
-            remove_ret = self.engine.remove_lora(lora_int_id)
-            if inspect.isawaitable(remove_ret):
-                await remove_ret
-
-        # Stage tensors on each worker process before engine.add_lora().
+        # Stage tensors on each worker process BEFORE removing the old adapter.
         # collective_rpc uses zmq+msgspec which cannot serialize PyTorch tensors — they
         # get deserialized as nested lists. Serialize to bytes (cloudpickle) first so
         # the worker can reconstruct proper tensors from the bytes payload.
+        #
+        # Staging must happen before remove_lora because vLLM's EngineCore may process
+        # a concurrent generation step between remove_lora and add_lora. That gen step
+        # calls _apply_adapters → _load_adapter for the just-removed adapter. If the
+        # tensors are not yet staged at that point, _load_adapter falls through to
+        # PEFTHelper.from_local_dir('simon_lora_path') → FileNotFoundError.
         import cloudpickle
 
         lora_tensors_bytes = cloudpickle.dumps(lora_tensors)
@@ -656,6 +655,13 @@ class vLLMHttpServer:
         )
         if inspect.isawaitable(stage_ret):
             await stage_ret
+
+        # Remove existing adapter for this tenant if present (tensors already staged above).
+        loaded_loras = await self.engine.list_loras()
+        if lora_int_id in loaded_loras:
+            remove_ret = self.engine.remove_lora(lora_int_id)
+            if inspect.isawaitable(remove_ret):
+                await remove_ret
 
         # Now call engine.add_lora() with a plain LoRARequest for engine-level tracking.
         # The worker's _load_adapter hijack will retrieve the actual tensors from the staged cache.

@@ -202,3 +202,13 @@ This is efficient because LoRA adapters are tiny (~50MB for rank-32 on 7B).
 - Overrode `_fit_postprocess_step()`: increments per-tenant `global_steps` rather than the shared counter.
 - Result: log now shows `[FullyAsyncTrainer][tenant=alice] global_steps: 1 local_trigger_step: 1 ...` and `[FullyAsyncTrainer][tenant=bob] global_steps: 1 local_trigger_step: 1 ...` independently.
 - Change: [verl/experimental/fully_async_policy/multi_tenant_trainer.py](verl/experimental/fully_async_policy/multi_tenant_trainer.py).
+
+## 2026-03-24 - Fix staged LoRA cache eviction crash
+
+- Run (job 1715693) hit `FileNotFoundError: 'simon_lora_path/adapter_config.json'` on vLLM workers after ~449 samples generated successfully.
+- Root cause: crash happens during a **weight sync** (`add_tenant_lora`). The traceback is `execute_model → _prepare_inputs → set_active_loras → _apply_adapters → add_adapter → _load_adapter` — i.e., a concurrent generation step (in-flight in the EngineCore's busy loop) calls `_load_adapter` for an adapter that was just removed. Two bugs combined:
+  1. **Ordering bug** ([vllm_async_server.py](verl/workers/rollout/vllm_rollout/vllm_async_server.py)): `stage_lora_tensors` was called AFTER `remove_lora`. The EngineCore processes a generation step between `remove_lora` and `engine.add_lora` completing. That gen step calls `_apply_adapters → _load_adapter` for the just-removed adapter, but the tensors haven't been staged yet → falls through to `PEFTHelper.from_local_dir('simon_lora_path')` → `FileNotFoundError`.
+  2. **Pop bug** ([verl/utils/vllm/utils.py](verl/utils/vllm/utils.py)): `_staged_lora_tensors.pop(lora_int_id)` removed the staged entry after first use. Any subsequent `_load_adapter` call (including from `_apply_adapters`) would also fall through.
+- Fix 1: reordered `add_tenant_lora` to stage tensors FIRST, then `remove_lora`, then `engine.add_lora`. Staged tensors are now available for any concurrent gen step that fires between remove and add.
+- Fix 2: changed `.pop()` to `[]` (non-destructive read) so staged entry persists for all subsequent `_load_adapter` calls.
+- Changes: [verl/workers/rollout/vllm_rollout/vllm_async_server.py](verl/workers/rollout/vllm_rollout/vllm_async_server.py), [verl/utils/vllm/utils.py](verl/utils/vllm/utils.py).
