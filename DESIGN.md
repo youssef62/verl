@@ -83,3 +83,56 @@ Tenant B data ──► Rollouter ──► vLLM (adapter B) ──► MessageQu
                                                      Sync adapter A   Sync adapter B
                                                      to vLLM          to vLLM
 ```
+
+## Metrics
+
+Metrics are split into two categories: **system-level** (shared resources) and **per-tenant** (training quality).
+
+### System-Level Metrics (logged every fit step at `total_fit_steps`)
+
+These measure shared infrastructure performance — the trainer and rollouter serve all tenants, so their timing is inherently global.
+
+| Metric | What it measures |
+|--------|-----------------|
+| `timing_s/gen` | Wall-clock time the trainer waited in `_fit_generate()` polling tenant queues until *any* tenant had enough samples. This is trainer idle time. |
+| `timing_s/step` | Total wall-clock time for one `fit_step` (gen + compute + update). |
+| `timing_s/ref` | Time computing reference policy log probs. |
+| `timing_s/values` | Time computing critic values. |
+| `timing_s/adv` | Time computing advantages. |
+| `timing_s/update_critic` | Time for critic gradient update. |
+| `timing_s/update_actor` | Time for actor (LoRA) gradient update. |
+| `timing_s/param_sync` | Time syncing updated LoRA weights to vLLM (only on param_sync steps). |
+| `fully_async/trainer/idle_ratio` | `timing_s/gen / timing_s/step` — fraction of step time spent waiting for samples. |
+| `fully_async/total_wait_time` | Cumulative queue wait time within sample collection. |
+| `perf/throughput` | Tokens/sec/GPU across all tenants. |
+
+**X-axis:** `total_fit_steps` — a monotonically increasing counter shared across all tenants (step 1 might be tenant A, step 2 tenant B, etc.).
+
+### Rollouter Metrics (logged at `current_param_version` on param_sync)
+
+The rollouter is a single shared actor generating for all tenants interleaved. Its time cannot be split per-tenant.
+
+| Metric | What it measures |
+|--------|-----------------|
+| `fully_async/rollouter/active_time` | Time the rollouter spent actively generating (for all tenants) since the last `reset_staleness` call. If the rollouter never paused, this equals `version_time`. |
+| `fully_async/rollouter/version_time` | Wall-clock time since the last `reset_staleness` call. |
+| `fully_async/rollouter/idle_ratio` | `1 - active_time / version_time` — fraction of time the rollouter was paused waiting for staleness to be reset. |
+
+### Per-Tenant Data Metrics (logged at `{tenant}/...` at that tenant's `global_steps`)
+
+These measure training quality for each tenant independently. They are accumulated in a per-tenant `MetricsAggregator` and flushed when that tenant hits `param_sync`.
+
+| Metric pattern | What it measures |
+|----------------|-----------------|
+| `{tenant}/critic/score/{mean,max,min}` | Reward model scores for this tenant's batches. |
+| `{tenant}/critic/rewards/{mean,max,min}` | Shaped rewards. |
+| `{tenant}/critic/advantages/{mean,max,min}` | GAE advantages. |
+| `{tenant}/actor/entropy` | Policy entropy. |
+| `{tenant}/actor/pg_loss` | Policy gradient loss. |
+| `{tenant}/actor/pg_clipfrac` | PPO clip fraction. |
+| `{tenant}/response_length/{mean,max,min}` | Generated response lengths. |
+| `{tenant}/training/global_step` | This tenant's own step counter. |
+| `{tenant}/active_tenant_lora_id` | LoRA adapter ID used for this tenant. |
+| `{tenant}/fully_async/count/stale_trajectory_processed` | Stale samples processed for this tenant. |
+
+**X-axis:** `tenant_global_steps[tenant_name]` — each tenant has its own independent step counter, so tenant A at step 10 means 10 training steps were performed on tenant A's data, regardless of how many steps tenant B took.
