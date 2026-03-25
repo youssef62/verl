@@ -391,9 +391,14 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
             self.staleness_samples = len(self.active_tasks) + total_queue_size
 
             timing_raw = {}
-            rollout_active_time = self.idle_start_time - self.step_start_time
             rollout_version_time = time.time() - self.step_start_time
-            idle_ratio = 1 - rollout_active_time / rollout_version_time
+            # If idle_start_time < step_start_time, the rollouter never paused
+            # in this window — it was active the entire time.
+            if self.idle_start_time >= self.step_start_time:
+                rollout_active_time = self.idle_start_time - self.step_start_time
+            else:
+                rollout_active_time = rollout_version_time
+            idle_ratio = 1 - rollout_active_time / rollout_version_time if rollout_version_time > 0 else 0.0
             timing_raw["fully_async/rollouter/active_time"] = rollout_active_time
             timing_raw["fully_async/rollouter/version_time"] = rollout_version_time
             timing_raw["fully_async/rollouter/idle_ratio"] = idle_ratio
