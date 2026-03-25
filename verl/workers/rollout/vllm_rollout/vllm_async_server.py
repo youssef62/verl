@@ -630,43 +630,42 @@ class vLLMHttpServer:
 
         Used by multi-tenant training to sync per-tenant adapters to the rollout engine.
 
-        The tensors are staged on each worker via collective_rpc("stage_lora_tensors") before
-        calling engine.add_lora(). This bypasses vLLM's internal msgspec transport, which would
-        downcast TensorLoRARequest → LoRARequest and drop peft_config/lora_tensors.
+        Loads the LoRA directly on each worker via collective_rpc("update_tenant_lora"),
+        mirroring the working single-tenant _update_weights path. The worker creates a
+        TensorLoRARequest locally and calls self.add_lora(), so the hijacked _load_adapter
+        sees proper tensor data without going through EngineCore serialization.
+
+        On the first call, also registers the LoRA with engine.add_lora() for engine-level
+        tracking (so vLLM accepts generation requests referencing this LoRA ID).
         """
         if self.node_rank != 0:
             return
 
-        # Remove existing adapter for this tenant if present
-        loaded_loras = await self.engine.list_loras()
-        if lora_int_id in loaded_loras:
-            remove_ret = self.engine.remove_lora(lora_int_id)
-            if inspect.isawaitable(remove_ret):
-                await remove_ret
-
-        # Stage tensors on each worker process before engine.add_lora().
-        # collective_rpc uses zmq+msgspec which cannot serialize PyTorch tensors — they
-        # get deserialized as nested lists. Serialize to bytes (cloudpickle) first so
-        # the worker can reconstruct proper tensors from the bytes payload.
         import cloudpickle
 
         lora_tensors_bytes = cloudpickle.dumps(lora_tensors)
-        stage_ret = self.engine.collective_rpc(
-            "stage_lora_tensors", args=(lora_int_id, peft_config, lora_tensors_bytes)
-        )
-        if inspect.isawaitable(stage_ret):
-            await stage_ret
 
-        # Now call engine.add_lora() with a plain LoRARequest for engine-level tracking.
-        # The worker's _load_adapter hijack will retrieve the actual tensors from the staged cache.
-        lora_request = LoRARequest(
-            lora_name=str(lora_int_id),
-            lora_int_id=lora_int_id,
-            lora_path=VLLM_LORA_PATH,
+        # Load/update LoRA directly on workers — avoids the race condition where
+        # engine.remove_lora() + engine.add_lora() left a window for in-flight
+        # generation requests to hit a removed LoRA.
+        update_ret = self.engine.collective_rpc(
+            "update_tenant_lora", args=(lora_int_id, peft_config, lora_tensors_bytes)
         )
-        add_ret = self.engine.add_lora(lora_request)
-        if inspect.isawaitable(add_ret):
-            await add_ret
+        if inspect.isawaitable(update_ret):
+            await update_ret
+
+        # Register with engine for engine-level tracking on first call only.
+        # On subsequent updates, the engine already knows about this lora_int_id.
+        loaded_loras = await self.engine.list_loras()
+        if lora_int_id not in loaded_loras:
+            lora_request = LoRARequest(
+                lora_name=str(lora_int_id),
+                lora_int_id=lora_int_id,
+                lora_path=VLLM_LORA_PATH,
+            )
+            add_ret = self.engine.add_lora(lora_request)
+            if inspect.isawaitable(add_ret):
+                await add_ret
 
         logger.info(f"[vLLMHttpServer] Added tenant LoRA adapter lora_int_id={lora_int_id}")
 

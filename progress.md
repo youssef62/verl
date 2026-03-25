@@ -202,3 +202,12 @@ This is efficient because LoRA adapters are tiny (~50MB for rank-32 on 7B).
 - Overrode `_fit_postprocess_step()`: increments per-tenant `global_steps` rather than the shared counter.
 - Result: log now shows `[FullyAsyncTrainer][tenant=alice] global_steps: 1 local_trigger_step: 1 ...` and `[FullyAsyncTrainer][tenant=bob] global_steps: 1 local_trigger_step: 1 ...` independently.
 - Change: [verl/experimental/fully_async_policy/multi_tenant_trainer.py](verl/experimental/fully_async_policy/multi_tenant_trainer.py).
+
+## 2026-03-25 - Fix LoRA sync race condition (`simon_lora_path/adapter_config.json` not found)
+
+- Run crashed at `FileNotFoundError: [Errno 2] No such file or directory: 'simon_lora_path/adapter_config.json'` in the vLLM worker during `execute_model` → `_load_adapter`, after the first parameter sync (bob's global_step=2 reached trigger_parameter_sync_step=2).
+- Root cause: `add_tenant_lora()` used `engine.remove_lora()` + `engine.add_lora()` which go through EngineCore. Between removing the LoRA and re-adding it, in-flight generation requests hit the worker and triggered `_load_adapter` on the now-removed LoRA. The hijack found no staged tensors and fell through to file-based loading on the dummy path `simon_lora_path`.
+- Fix: replaced the staging approach (`engine.remove_lora` → `collective_rpc("stage_lora_tensors")` → `engine.add_lora`) with a direct worker update via `collective_rpc("update_tenant_lora")`. The new `update_tenant_lora` method on `vLLMColocateWorkerExtension` creates a `TensorLoRARequest` locally on the worker and calls `self.remove_lora()` + `self.add_lora()` — this mirrors the working single-tenant `_update_weights` path and executes atomically on the worker (no race window). Engine-level registration via `engine.add_lora()` is only done once on the first call for LoRA ID tracking.
+- Changes:
+  - [verl/workers/rollout/vllm_rollout/utils.py](verl/workers/rollout/vllm_rollout/utils.py): Replaced `stage_lora_tensors()` with `update_tenant_lora()` on `vLLMColocateWorkerExtension`.
+  - [verl/workers/rollout/vllm_rollout/vllm_async_server.py](verl/workers/rollout/vllm_rollout/vllm_async_server.py): Rewrote `add_tenant_lora()` to use `collective_rpc("update_tenant_lora")` instead of the staging + engine.add_lora path.

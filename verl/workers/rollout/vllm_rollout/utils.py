@@ -229,21 +229,32 @@ class vLLMColocateWorkerExtension:
                 logger.info("Loading standard weights (non-FP8, async)")
                 self.model_runner.model.load_weights(weights)
 
-    def stage_lora_tensors(self, lora_int_id: int, peft_config: dict, lora_tensors_bytes: bytes):
-        """Stage LoRA tensors locally so the hijacked _load_adapter can find them.
+    def update_tenant_lora(self, lora_int_id: int, peft_config: dict, lora_tensors_bytes: bytes):
+        """Load or update a tenant's LoRA adapter directly on this worker.
 
-        Called via collective_rpc before engine.add_lora() to work around the vLLM
-        engine's internal msgspec transport, which cannot serialize PyTorch tensors
-        (they arrive as nested lists). The caller must serialize tensors to bytes via
-        cloudpickle.dumps() before calling this method.
+        Called via collective_rpc from add_tenant_lora(). This mirrors the working
+        single-tenant _update_weights path: creates a TensorLoRARequest locally on
+        the worker and calls self.add_lora(), so the hijacked _load_adapter sees a
+        proper TensorLoRARequest with peft_config and lora_tensors.
+
+        This avoids the race condition in the old approach (engine.remove_lora +
+        engine.add_lora through EngineCore) where in-flight generation requests
+        could hit a removed LoRA before the new one was registered.
         """
         import cloudpickle
 
-        from verl.utils.vllm.utils import _staged_lora_tensors
-
         lora_tensors = cloudpickle.loads(lora_tensors_bytes)
-        _staged_lora_tensors[lora_int_id] = (peft_config, lora_tensors)
-        logger.info(f"[vLLMColocateWorker] Staged LoRA tensors for lora_int_id={lora_int_id}")
+        lora_request = TensorLoRARequest(
+            lora_name=str(lora_int_id),
+            lora_int_id=lora_int_id,
+            lora_path=VLLM_LORA_PATH,
+            peft_config=peft_config,
+            lora_tensors=lora_tensors,
+        )
+        # Remove old LoRA from worker cache before adding updated one
+        self.remove_lora(lora_int_id)
+        self.add_lora(lora_request)
+        logger.info(f"[vLLMColocateWorker] Updated tenant LoRA lora_int_id={lora_int_id}")
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication."""
