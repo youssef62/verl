@@ -98,6 +98,26 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         # Shared step counter across all tenants (monotonic, for system timing x-axis)
         self.total_fit_steps = 0
 
+        # Will be populated in set_total_train_steps
+        self.tenant_progress_bars: dict[str, Any] = {}
+
+    def set_total_train_steps(self, total_training_steps):
+        """Override: create per-tenant progress bars instead of a single global one."""
+        from tqdm import tqdm
+
+        super().set_total_train_steps(total_training_steps)
+
+        # total_training_steps is the global total across all tenants.
+        # Each tenant gets an equal share as its progress bar total.
+        n_tenants = len(self.tenant_configs)
+        per_tenant_steps = total_training_steps // n_tenants
+        for tc in self.tenant_configs:
+            self.tenant_progress_bars[tc.name] = tqdm(
+                total=per_tenant_steps,
+                initial=0,
+                desc=f"[{tc.name}]",
+            )
+
     def set_tenant_queue_clients(self, tenant_queue_clients: dict[str, MessageQueueClient]):
         """Set per-tenant message queue clients."""
         self.tenant_queue_clients = tenant_queue_clients
@@ -409,6 +429,8 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
             self.global_steps += 1
 
         if self.local_trigger_step == 1:
+            if tenant_name in self.tenant_progress_bars:
+                self.tenant_progress_bars[tenant_name].update(1)
             self.progress_bar.update(1)
 
     def _collect_metrics_from_samples(self, batch, metrics):
