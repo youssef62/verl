@@ -69,6 +69,15 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
         # Per-tenant queue clients (set later by main)
         self.tenant_queue_clients: dict[str, MessageQueueClient] = {}
 
+        # Scheduling strategy: "round_robin" (interleave tenants) or "burst" (fill one tenant at a time)
+        self.scheduling = getattr(config, "multi_tenant", {}).get("scheduling", "round_robin") if hasattr(config, "multi_tenant") else "round_robin"
+        if self.scheduling not in ("round_robin", "burst"):
+            raise ValueError(f"Unknown scheduling strategy: {self.scheduling!r}, expected 'round_robin' or 'burst'")
+        print(f"[MTRollouter] Scheduling strategy: {self.scheduling}")
+
+        # Burst state: index into tenant_configs for the current focus tenant
+        self._burst_index = 0
+
         # Per-tenant staleness counters (independent of scheduling strategy)
         self.tenant_staleness_samples: dict[str, int] = {tc.name: 0 for tc in tenant_configs}
 
@@ -134,97 +143,152 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
     async def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         pass  # Not used in multi-tenant mode
 
-    def _schedule_next_tenants(self, active_tenants: list[TenantConfig]) -> list[TenantConfig]:
-        """Scheduling strategy: return ordered list of tenants to try this round.
-
-        Default is round-robin (preserves order of active_tenants).
-        Override this method to change the scheduling strategy (priority-based,
-        weighted, etc.) without touching staleness or queue-gating logic.
-        """
-        return list(active_tenants)
+    def _advance_burst_index(self, active_tenants: list[TenantConfig]):
+        """Advance burst focus to the next active tenant (circular)."""
+        active_names = {tc.name for tc in active_tenants}
+        for _ in range(len(self.tenant_configs)):
+            self._burst_index = (self._burst_index + 1) % len(self.tenant_configs)
+            if self.tenant_configs[self._burst_index].name in active_names:
+                return
+        # All exhausted — leave index as-is
 
     async def _feed_samples(self):
-        """Override: feed samples with per-tenant staleness and queue-fullness gating.
+        """Override: route to the scheduling-specific feed implementation."""
+        if self.scheduling == "burst":
+            await self._feed_samples_burst()
+        else:
+            await self._feed_samples_round_robin()
 
-        Key properties:
-        - Scheduling is delegated to _schedule_next_tenants() (overrideable)
-        - Staleness and queue-full checks are per-tenant and independent
-        - Dataloader is only advanced when a tenant passes all gates (no data waste)
-        - When all tenants are gated, waits on condition variable for reset/drain signal
-        """
+    def _is_tenant_gated(self, tc: TenantConfig) -> bool:
+        """Check if a tenant is blocked by staleness or queue-full gates."""
+        if (self.max_required_samples is not None
+                and self.tenant_staleness_samples.get(tc.name, 0) >= self.max_required_samples):
+            return True
+        if self.max_queue_size is not None and self.tenant_queue_clients:
+            queue_size = self.tenant_queue_clients[tc.name].get_statistics_sync()["queue_size"]
+            if queue_size >= self.max_queue_size:
+                return True
+        return False
+
+    async def _enqueue_sample(self, tc: TenantConfig, batch_dict, epoch: int) -> bool:
+        """Prepare and enqueue a single rollout sample. Returns False if total steps reached."""
+        full_batch = prepare_single_generation_data(batch_dict, self.config)
+        full_batch.meta_info["_lora_int_id"] = tc.lora_int_id
+        sample_id = f"sample_{tc.name}_{epoch}_{self.global_steps}"
+        rollout_sample = RolloutSample(
+            full_batch=full_batch,
+            sample_id=sample_id,
+            epoch=epoch,
+            rollout_status={},
+            tenant_id=tc.name,
+        )
+
+        await self.pending_queue.put(rollout_sample)
+        self.tenant_staleness_samples[tc.name] = self.tenant_staleness_samples.get(tc.name, 0) + 1
+
+        if self.global_steps >= self.total_rollout_steps:
+            print(
+                f"[MTRollouter][Feed] Maximum count reached, stopping: "
+                f"{self.global_steps} >= {self.total_rollout_steps}"
+            )
+            await self.pending_queue.put(None)
+            print(f"[MTRollouter][Feed] Sample addition complete, {self.global_steps} samples added")
+            return False
+
+        self.global_steps += 1
+        return True
+
+    async def _wait_for_ungate(self):
+        """Wait for a staleness reset or queue drain signal."""
+        async with self.lock:
+            print(
+                f"[MTRollouter][Feed] All active tenants gated this round, waiting. "
+                f"staleness={dict(self.tenant_staleness_samples)}"
+            )
+            await self.condition.wait()
+
+    async def _feed_samples_round_robin(self):
+        """Feed samples interleaving all tenants: A, B, A, B, ..."""
         for epoch in range(self.config.trainer.total_epochs):
             tenant_iters = {tc.name: iter(self.tenant_dataloaders[tc.name]) for tc in self.tenant_configs}
             active_tenants = list(self.tenant_configs)
 
             while active_tenants:
-                scheduled = self._schedule_next_tenants(active_tenants)
                 made_progress = False
                 next_active = []
 
-                for tc in scheduled:
-                    # Per-tenant staleness gate: skip without advancing the dataloader
-                    if (self.max_required_samples is not None and
-                            self.tenant_staleness_samples.get(tc.name, 0) >= self.max_required_samples):
+                for tc in active_tenants:
+                    if self._is_tenant_gated(tc):
                         next_active.append(tc)
                         continue
 
-                    # Per-tenant queue-full gate: skip without advancing the dataloader
-                    if self.max_queue_size is not None and self.tenant_queue_clients:
-                        queue_size = self.tenant_queue_clients[tc.name].get_statistics_sync()["queue_size"]
-                        if queue_size >= self.max_queue_size:
-                            next_active.append(tc)
-                            continue
-
-                    # All gates passed — pull next batch (dataloader only advanced here)
                     try:
                         batch_dict = next(tenant_iters[tc.name])
                     except StopIteration:
                         print(f"[MTRollouter] Tenant '{tc.name}' exhausted in epoch {epoch}")
-                        continue  # exhausted: not added to next_active
+                        continue
 
                     next_active.append(tc)
-
-                    full_batch = prepare_single_generation_data(batch_dict, self.config)
-                    full_batch.meta_info["_lora_int_id"] = tc.lora_int_id
-                    sample_id = f"sample_{tc.name}_{epoch}_{self.global_steps}"
-                    rollout_sample = RolloutSample(
-                        full_batch=full_batch,
-                        sample_id=sample_id,
-                        epoch=epoch,
-                        rollout_status={},
-                        tenant_id=tc.name,
-                    )
-
-                    await self.pending_queue.put(rollout_sample)
-                    self.tenant_staleness_samples[tc.name] = self.tenant_staleness_samples.get(tc.name, 0) + 1
-                    made_progress = True
-
-                    if self.global_steps >= self.total_rollout_steps:
-                        print(
-                            f"[MTRollouter][Feed] Maximum count reached, stopping: "
-                            f"{self.global_steps} >= {self.total_rollout_steps}"
-                        )
-                        await self.pending_queue.put(None)
-                        print(f"[MTRollouter][Feed] Sample addition complete, {self.global_steps} samples added")
+                    if not await self._enqueue_sample(tc, batch_dict, epoch):
                         return
-
-                    self.global_steps += 1
+                    made_progress = True
 
                 active_tenants = next_active
 
-                # No tenant made progress this round — all are gated.
-                # Wait for a staleness reset or queue drain signal.
                 if not made_progress and active_tenants:
-                    async with self.lock:
-                        print(
-                            f"[MTRollouter][Feed] All active tenants gated this round, waiting. "
-                            f"staleness={dict(self.tenant_staleness_samples)}"
-                        )
-                        await self.condition.wait()
+                    await self._wait_for_ungate()
 
-        # All epochs exhausted
         await self.pending_queue.put(None)
         print(f"[MTRollouter][Feed] Sample addition complete, {self.global_steps} samples added")
+
+    async def _feed_samples_burst(self):
+        """Feed samples filling one tenant at a time before moving to the next."""
+        for epoch in range(self.config.trainer.total_epochs):
+            tenant_iters = {tc.name: iter(self.tenant_dataloaders[tc.name]) for tc in self.tenant_configs}
+            active_tenants = list(self.tenant_configs)
+            self._burst_index = 0
+
+            while active_tenants:
+                focus = self._get_burst_focus(active_tenants)
+                if focus is None:
+                    break
+
+                if self._is_tenant_gated(focus):
+                    # Focus tenant gated — try rotating through others before waiting
+                    self._advance_burst_index(active_tenants)
+                    rotations = 1
+                    while rotations < len(active_tenants):
+                        focus = self._get_burst_focus(active_tenants)
+                        if focus is not None and not self._is_tenant_gated(focus):
+                            break
+                        self._advance_burst_index(active_tenants)
+                        rotations += 1
+                    else:
+                        # Full rotation, all gated — wait
+                        await self._wait_for_ungate()
+                    continue
+
+                try:
+                    batch_dict = next(tenant_iters[focus.name])
+                except StopIteration:
+                    print(f"[MTRollouter] Tenant '{focus.name}' exhausted in epoch {epoch}")
+                    active_tenants = [tc for tc in active_tenants if tc.name != focus.name]
+                    self._advance_burst_index(active_tenants)
+                    continue
+
+                if not await self._enqueue_sample(focus, batch_dict, epoch):
+                    return
+
+        await self.pending_queue.put(None)
+        print(f"[MTRollouter][Feed] Sample addition complete, {self.global_steps} samples added")
+
+    def _get_burst_focus(self, active_tenants: list[TenantConfig]) -> TenantConfig | None:
+        """Return the current burst focus tenant if it's still active."""
+        focus_name = self.tenant_configs[self._burst_index].name
+        for tc in active_tenants:
+            if tc.name == focus_name:
+                return tc
+        return None
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Override: generate with tenant LoRA and route to tenant's queue."""

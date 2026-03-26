@@ -13,6 +13,7 @@ MODEL_PATH=${MODEL_PATH:-"${HOME}/models/Qwen2.5-Math-7B"}
 TENANTS=${TENANTS:-"alice:${HOME}/data/dapo-math-17k.parquet:${HOME}/data/aime-2024.parquet,bob:${HOME}/data/dapo-math-17k.parquet:${HOME}/data/aime-2024.parquet"}
 tenant_count=$(echo "${TENANTS}" | awk -F',' '{print NF}')
 max_loras=${MAX_LORAS:-${tenant_count}}
+scheduling=${SCHEDULING:-"round_robin"}  # "round_robin" or "burst"
 
 # Naming
 project_name=${PROJECT_NAME:-'MULTI_TENANT_LORA'}
@@ -95,6 +96,7 @@ python3 "${REPO_ROOT}/lora/patch_vllm_decorators.py"
 # Keep literal quotes for Hydra so commas are treated as part of one string value.
 PYTHONUNBUFFERED=1 python -m verl.experimental.fully_async_policy.multi_tenant_main \
     +multi_tenant.tenants="'${TENANTS}'" \
+    +multi_tenant.scheduling=${scheduling} \
     data.prompt_key=prompt \
     data.truncation='left' \
     data.max_prompt_length=${max_prompt_length} \
