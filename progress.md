@@ -211,3 +211,19 @@ This is efficient because LoRA adapters are tiny (~50MB for rank-32 on 7B).
 - Changes:
   - [verl/workers/rollout/vllm_rollout/utils.py](verl/workers/rollout/vllm_rollout/utils.py): Replaced `stage_lora_tensors()` with `update_tenant_lora()` on `vLLMColocateWorkerExtension`.
   - [verl/workers/rollout/vllm_rollout/vllm_async_server.py](verl/workers/rollout/vllm_rollout/vllm_async_server.py): Rewrote `add_tenant_lora()` to use `collective_rpc("update_tenant_lora")` instead of the staging + engine.add_lora path.
+
+## 2026-03-25 - Burst scheduling for multi-tenant rollouter
+
+- Added `burst` scheduling as an alternative to `round_robin` in `MultiTenantRollouter`. In burst mode, all samples for one tenant are fed until that tenant is gated (staleness or queue-full), then the next tenant is served. This avoids the overhead of interleaving tenants every round.
+- Refactored `_feed_samples()` into a 3-line router that dispatches to `_feed_samples_round_robin()` or `_feed_samples_burst()`. Shared logic extracted into helpers: `_is_tenant_gated()`, `_enqueue_sample()`, `_wait_for_ungate()`.
+- Configurable via `SCHEDULING=burst` env var or `+multi_tenant.scheduling=burst` Hydra override (default: `round_robin`).
+- Changes: [verl/experimental/fully_async_policy/multi_tenant_rollouter.py](verl/experimental/fully_async_policy/multi_tenant_rollouter.py), [multi_tenant_run.sh](multi_tenant_run.sh).
+
+## 2026-03-26 - Fix multi-tenant metrics misattribution and wandb visibility
+
+- Two issues identified from wandb and `log.out`:
+  1. **Misattributed system metrics**: Rollouter-level stats (queue sizes per tenant, staleness counters, static config) flowed through `batch.meta_info` → `_collect_metrics_from_samples` → `_fit_postprocess_step`, where they were classified as per-tenant data metrics and prefixed with the active tenant (e.g. `alice/fully_async/monitor/queue/bob_queue_size`).
+  2. **Bob's metrics invisible in wandb**: Three different step counters (`total_fit_steps`, `current_param_version`, `tenant_global_steps`) were used with the same wandb logger. Since wandb requires monotonically increasing steps, once system metrics pushed the step to e.g. 17, all subsequent tenant logs at lower steps were silently dropped. Bob's `tenant_global_steps` was always behind alice's, making bob's metrics completely invisible.
+- Fix 1: Added rollouter-level prefixes (`fully_async/monitor/`, `fully_async/static/`, `fully_async/count/staleness_`, `fully_async/count/total_generated_samples`, `fully_async/count/dropped_stale_samples`) to `_SYSTEM_METRIC_PREFIXES` in `detach_utils.py`. These now log as system metrics without tenant prefix.
+- Fix 2: Unified all `logger.log()` calls in `_fit_update_weights` to use `total_fit_steps` as the step counter, matching `_fit_postprocess_step`. Per-tenant `global_step` and `epoch` are already included as metric values in the aggregated data.
+- Changes: [verl/experimental/fully_async_policy/detach_utils.py](verl/experimental/fully_async_policy/detach_utils.py), [verl/experimental/fully_async_policy/multi_tenant_trainer.py](verl/experimental/fully_async_policy/multi_tenant_trainer.py).
