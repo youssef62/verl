@@ -284,17 +284,19 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         # Update tenant-specific param version
         self.tenant_param_versions[tenant_name] = self.current_param_version
 
-        # Rollouter staleness metrics (system-level, logged at current_param_version)
+        # Rollouter staleness metrics (system-level, logged at total_fit_steps to keep
+        # wandb steps monotonically increasing — all logs use the same step counter)
         timing_raw = ray.get(self.rollouter.reset_staleness.remote(tenant_name))
-        self.logger.log(data=timing_raw, step=self.current_param_version)
+        self.logger.log(data=timing_raw, step=self.total_fit_steps)
 
-        # Per-tenant data metrics: flush aggregator, prefix with tenant name,
-        # log at this tenant's global_steps
+        # Per-tenant data metrics: flush aggregator, prefix with tenant name.
+        # Include tenant's own global_step as a metric so it's visible in wandb,
+        # but log at total_fit_steps to avoid wandb step-ordering warnings.
         if tenant_name in self.tenant_metrics_aggregators:
             tenant_agg = self.tenant_metrics_aggregators[tenant_name].get_aggregated_metrics()
             prefixed = {f"{tenant_name}/{k}": v for k, v in tenant_agg.items()}
             prefixed[f"{tenant_name}/active_tenant_lora_id"] = lora_int_id
-            self.logger.log(data=prefixed, step=self.tenant_global_steps[tenant_name])
+            self.logger.log(data=prefixed, step=self.total_fit_steps)
             self.tenant_metrics_aggregators[tenant_name].reset()
 
     async def _sync_tenant_lora_to_rollout(self, tenant_name: str):

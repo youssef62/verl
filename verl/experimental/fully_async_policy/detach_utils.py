@@ -24,7 +24,19 @@ from verl import DataProto
 from verl.trainer.ppo.ray_trainer import compute_response_mask
 
 
-_SYSTEM_METRIC_PREFIXES = ("timing_s/", "timing_per_token_ms/", "perf/")
+_SYSTEM_METRIC_PREFIXES = (
+    "timing_s/",
+    "timing_per_token_ms/",
+    "perf/",
+    # Rollouter-level stats from get_statistics() — these describe the shared
+    # rollouter state across all tenants and should not be attributed to any
+    # single tenant.
+    "fully_async/monitor/",
+    "fully_async/static/",
+    "fully_async/count/staleness_",
+    "fully_async/count/total_generated_samples",
+    "fully_async/count/dropped_stale_samples",
+)
 _SYSTEM_METRIC_EXACT = {"fully_async/total_wait_time"}
 
 
