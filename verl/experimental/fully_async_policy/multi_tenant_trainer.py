@@ -135,33 +135,39 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         return _TENANT_VERSION_BASE + idx
 
     def _init_tenant_model_states(self):
-        """Save the initial model state for all tenants.
+        """Save the initial model and optimizer state for all tenants.
 
         All tenants start with the same initial adapter weights (from the base model + random LoRA init).
         We save a copy per tenant so we can swap between them later.
         """
-        print("[MTTrainer] Initializing per-tenant model states on CPU...")
+        print("[MTTrainer] Initializing per-tenant model and optimizer states on CPU...")
         for tc in self.tenant_configs:
-            self.actor_rollout_wg.save_model_to_cpu(self._tenant_version_key(tc.name))
+            key = self._tenant_version_key(tc.name)
+            self.actor_rollout_wg.save_model_to_cpu(key)
+            self.actor_rollout_wg.save_optimizer_to_cpu(key)
             print(f"[MTTrainer] Saved initial state for tenant '{tc.name}'")
 
         self.active_tenant = self.tenant_configs[0].name
         print(f"[MTTrainer] Active tenant set to '{self.active_tenant}'")
 
     def _switch_tenant(self, new_tenant: str):
-        """Swap LoRA adapter weights to a different tenant."""
+        """Swap LoRA adapter weights and optimizer state to a different tenant."""
         if self.active_tenant == new_tenant:
             return
 
         print(f"[MTTrainer] Switching from tenant '{self.active_tenant}' to '{new_tenant}'")
         switch_start = time.time()
 
-        # Save current tenant's model state
+        # Save current tenant's model + optimizer state
         if self.active_tenant is not None:
-            self.actor_rollout_wg.save_model_to_cpu(self._tenant_version_key(self.active_tenant))
+            key = self._tenant_version_key(self.active_tenant)
+            self.actor_rollout_wg.save_model_to_cpu(key)
+            self.actor_rollout_wg.save_optimizer_to_cpu(key)
 
-        # Restore new tenant's model state
-        self.actor_rollout_wg.restore_model_from_cpu(self._tenant_version_key(new_tenant))
+        # Restore new tenant's model + optimizer state
+        key = self._tenant_version_key(new_tenant)
+        self.actor_rollout_wg.restore_model_from_cpu(key)
+        self.actor_rollout_wg.restore_optimizer_from_cpu(key)
         self.active_tenant = new_tenant
 
         switch_time = time.time() - switch_start

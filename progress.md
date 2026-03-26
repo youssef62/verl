@@ -227,3 +227,10 @@ This is efficient because LoRA adapters are tiny (~50MB for rank-32 on 7B).
 - Fix 1: Added rollouter-level prefixes (`fully_async/monitor/`, `fully_async/static/`, `fully_async/count/staleness_`, `fully_async/count/total_generated_samples`, `fully_async/count/dropped_stale_samples`) to `_SYSTEM_METRIC_PREFIXES` in `detach_utils.py`. These now log as system metrics without tenant prefix.
 - Fix 2: Unified all `logger.log()` calls in `_fit_update_weights` to use `total_fit_steps` as the step counter, matching `_fit_postprocess_step`. Per-tenant `global_step` and `epoch` are already included as metric values in the aggregated data.
 - Changes: [verl/experimental/fully_async_policy/detach_utils.py](verl/experimental/fully_async_policy/detach_utils.py), [verl/experimental/fully_async_policy/multi_tenant_trainer.py](verl/experimental/fully_async_policy/multi_tenant_trainer.py).
+
+## 2026-03-26 - Fix optimizer state lost on tenant switch
+
+- `_switch_tenant()` called `save_model_to_cpu` / `restore_model_from_cpu` which only saves/restores **model parameters** — Adam optimizer state (momentum `exp_avg`, variance `exp_avg_sq`) and LR scheduler state were not preserved. Each tenant was effectively training with vanilla SGD (fresh optimizer) instead of Adam, producing anomalously fast `timing_s/update_actor` (~30s vs ~125s in single-tenant) and hurting convergence.
+- Added `save_optimizer_to_cpu(n)` and `restore_optimizer_from_cpu(n)` methods to `DetachActorWorker`. These deep-copy per-param optimizer state tensors to/from CPU, handling FSDP2 DTensor local shards via `_local_tensor`. LR scheduler state is saved/restored via `state_dict()` / `load_state_dict()`.
+- Updated `_switch_tenant()` and `_init_tenant_model_states()` in `MultiTenantTrainer` to call the new methods alongside the existing model save/restore.
+- Changes: [verl/experimental/separation/engine_workers.py](verl/experimental/separation/engine_workers.py), [verl/experimental/fully_async_policy/multi_tenant_trainer.py](verl/experimental/fully_async_policy/multi_tenant_trainer.py).

@@ -16,6 +16,7 @@
 import logging
 import os
 
+import torch
 from omegaconf import DictConfig
 
 from verl.single_controller.base.decorator import Dispatch, register
@@ -116,6 +117,86 @@ class DetachActorWorker(ActorRolloutRefWorker):
                 self.restore_handler(self.actor.engine.module, cpu_sharded_state, global_spec)
             else:
                 self.restore_handler(self.actor.engine.module, self.cpu_saved_models[n])
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_optimizer_to_cpu(self, n):
+        """Save the current optimizer and LR scheduler state to CPU memory.
+
+        Each param's state (exp_avg, exp_avg_sq for Adam) is deep-copied to CPU.
+        For FSDP2 DTensor params, we extract the local shard via _local_tensor.
+
+        Args:
+            n: Identifier/Key for the saved state.
+        """
+        import copy
+
+        if not hasattr(self, "cpu_saved_optimizers"):
+            self.cpu_saved_optimizers = {}
+
+        optimizer = self.actor.engine.optimizer
+        if optimizer is None:
+            return
+
+        # Deep-copy optimizer state tensors to CPU (sharded — each rank saves its own shard)
+        cpu_state = {}
+        for param, state in optimizer.state.items():
+            saved = {}
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    # For DTensor (FSDP2), extract the local shard
+                    raw = v._local_tensor if hasattr(v, "_local_tensor") else v
+                    saved[k] = raw.detach().cpu().clone()
+                else:
+                    saved[k] = copy.deepcopy(v)
+            cpu_state[param] = saved
+
+        # Save LR scheduler state
+        lr_scheduler = self.actor.engine.lr_scheduler
+        lr_state = lr_scheduler.state_dict() if lr_scheduler is not None else None
+
+        self.cpu_saved_optimizers[n] = (cpu_state, lr_state)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def restore_optimizer_from_cpu(self, n):
+        """Restore optimizer and LR scheduler state from CPU memory.
+
+        For FSDP2 DTensor params, copies data into the existing _local_tensor in-place.
+
+        Args:
+            n: Identifier/Key for the saved state to restore.
+        """
+        if not hasattr(self, "cpu_saved_optimizers") or n not in self.cpu_saved_optimizers:
+            return
+
+        optimizer = self.actor.engine.optimizer
+        if optimizer is None:
+            return
+
+        cpu_state, lr_state = self.cpu_saved_optimizers[n]
+
+        # Restore optimizer state tensors to GPU
+        for param, state in cpu_state.items():
+            if param not in optimizer.state:
+                optimizer.state[param] = {}
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    live_v = optimizer.state[param].get(k)
+                    if live_v is not None and hasattr(live_v, "_local_tensor"):
+                        # DTensor: copy into the existing local shard in-place
+                        live_v._local_tensor.copy_(v.to(live_v._local_tensor.device))
+                    elif live_v is not None:
+                        live_v.copy_(v.to(live_v.device))
+                    else:
+                        target_device = param._local_tensor.device if hasattr(param, "_local_tensor") else param.device
+                        optimizer.state[param][k] = v.to(target_device, non_blocking=True)
+                else:
+                    optimizer.state[param][k] = v
+
+        # Restore LR scheduler state
+        if lr_state is not None:
+            lr_scheduler = self.actor.engine.lr_scheduler
+            if lr_scheduler is not None:
+                lr_scheduler.load_state_dict(lr_state)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def clear_cpu_model(self, n):
