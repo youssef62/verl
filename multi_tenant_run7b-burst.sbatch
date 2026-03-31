@@ -4,7 +4,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --mem=200G
 #SBATCH --partition=debug
-#SBATCH --time=00:30:00
+#SBATCH --time=01:00:00
 #SBATCH --account=infra01
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=64
@@ -23,5 +23,6 @@ export LORA_ALPHA=${LORA_ALPHA:-32}
 export EXP_NAME=${EXP_NAME:-'MT-DAPO-Qwen2.5-7b-vllm-fully-async-2-2-2tenants'}
 export STALENESS_THRESHOLD=${STALENESS_THRESHOLD:-0.1}
 export TRIGGER_PARAMETER_SYNC_STEP=${TRIGGER_PARAMETER_SYNC_STEP:-2}
+export SCHEDULING="burst"
 
 bash "${REPO_ROOT}/multi_tenant_run.sh" "$@"
