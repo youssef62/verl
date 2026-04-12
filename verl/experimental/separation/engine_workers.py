@@ -226,6 +226,10 @@ class DetachActorWorker(ActorRolloutRefWorker):
         )
         if peft_config is None:
             return None, None
+        # PEFTHelper.from_dict (used in hijack__load_adapter) expects a plain dict,
+        # but get_per_tensor_param returns the raw LoraConfig object.
+        if hasattr(peft_config, "to_dict"):
+            peft_config = peft_config.to_dict()
         # Collect the generator into a dict of CPU tensors
         state_dict = {}
         for name, tensor in per_tensor_param:
