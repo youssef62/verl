@@ -143,11 +143,20 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         print("[MTTrainer] Initializing per-tenant model and optimizer states on CPU...")
         for tc in self.tenant_configs:
             key = self._tenant_version_key(tc.name)
+            # Apply per-tenant LR override BEFORE saving, so the snapshot carries
+            # the tenant's own learning rate in param_groups + scheduler base_lrs.
+            if tc.learning_rate is not None:
+                print(f"[MTTrainer] Setting tenant '{tc.name}' learning_rate={tc.learning_rate}")
+                self.actor_rollout_wg.set_learning_rate(tc.learning_rate)
             self.actor_rollout_wg.save_model_to_cpu(key)
             self.actor_rollout_wg.save_optimizer_to_cpu(key)
             print(f"[MTTrainer] Saved initial state for tenant '{tc.name}'")
 
-        self.active_tenant = self.tenant_configs[0].name
+        # Leave GPU state matching the first tenant (the one we declare active).
+        first_tenant = self.tenant_configs[0]
+        self.actor_rollout_wg.restore_model_from_cpu(self._tenant_version_key(first_tenant.name))
+        self.actor_rollout_wg.restore_optimizer_from_cpu(self._tenant_version_key(first_tenant.name))
+        self.active_tenant = first_tenant.name
         print(f"[MTTrainer] Active tenant set to '{self.active_tenant}'")
 
     def _switch_tenant(self, new_tenant: str):

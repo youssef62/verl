@@ -10,7 +10,8 @@ REPO_ROOT="${REPO_ROOT:-"/users/${USER}/scratch/rl-as-a-service"}"
 MODEL_PATH=${MODEL_PATH:-"${HOME}/models/Qwen2.5-Math-7B"}
 
 # Tenant definitions: comma-separated list of "name:train_file:val_file"
-TENANTS=${TENANTS:-"alice:${HOME}/data/gsm8k/train.parquet:${HOME}/data/gsm8k/test.parquet,bob:${HOME}/data/gsm8k/train.parquet:${HOME}/data/gsm8k/test.parquet"}
+TENANTS=${TENANTS:-"alice:${HOME}/data/gsm8k/train.parquet:${HOME}/data/gsm8k/test.parquet:1e-6,bob:${HOME}/data/gsm8k/train.parquet:${HOME}/data/gsm8k/test.parquet:5e-5"}
+
 tenant_count=$(echo "${TENANTS}" | awk -F',' '{print NF}')
 max_loras=${MAX_LORAS:-${tenant_count}}
 scheduling=${SCHEDULING:-"round_robin"}  # "round_robin" or "burst"

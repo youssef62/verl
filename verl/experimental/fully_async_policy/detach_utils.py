@@ -53,24 +53,30 @@ class TenantConfig:
     train_file: str
     val_file: str
     lora_int_id: int  # unique per tenant for vLLM multi-LoRA
+    learning_rate: float | None = None  # per-tenant LR override; None = use config default
 
 
 def parse_tenants(tenants_str: str) -> list[TenantConfig]:
-    """Parse TENANTS env var format: 'name:train_file:val_file,...'
+    """Parse TENANTS env var format: 'name:train_file:val_file[:lr],...'
 
-    Each tenant gets a unique lora_int_id starting from 1.
+    The 4th field (learning rate) is optional. Each tenant gets a unique
+    lora_int_id starting from 1.
     """
     tenants = []
     for i, entry in enumerate(tenants_str.split(",")):
         parts = entry.strip().split(":")
-        if len(parts) != 3:
-            raise ValueError(f"Invalid tenant entry '{entry}'. Expected 'name:train_file:val_file'")
+        if len(parts) not in (3, 4):
+            raise ValueError(
+                f"Invalid tenant entry '{entry}'. Expected 'name:train_file:val_file[:lr]'"
+            )
+        lr = float(parts[3]) if len(parts) == 4 and parts[3] else None
         tenants.append(
             TenantConfig(
                 name=parts[0],
                 train_file=parts[1],
                 val_file=parts[2],
                 lora_int_id=i + 1,  # 1-indexed to avoid 0
+                learning_rate=lr,
             )
         )
     return tenants
