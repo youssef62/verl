@@ -10,7 +10,7 @@ REPO_ROOT="${REPO_ROOT:-"/users/${USER}/scratch/rl-as-a-service"}"
 MODEL_PATH=${MODEL_PATH:-"${HOME}/models/Qwen2.5-Math-7B"}
 
 # Tenant definitions: comma-separated list of "name:train_file:val_file"
-TENANTS=${TENANTS:-"alice:${HOME}/data/dapo-math-17k.parquet:${HOME}/data/aime-2024.parquet,bob:${HOME}/data/dapo-math-17k.parquet:${HOME}/data/aime-2024.parquet"}
+TENANTS=${TENANTS:-"alice:${HOME}/data/gsm8k/train.parquet:${HOME}/data/gsm8k/test.parquet,bob:${HOME}/data/gsm8k/train.parquet:${HOME}/data/gsm8k/test.parquet"}
 tenant_count=$(echo "${TENANTS}" | awk -F',' '{print NF}')
 max_loras=${MAX_LORAS:-${tenant_count}}
 scheduling=${SCHEDULING:-"round_robin"}  # "round_robin" or "burst"
@@ -82,16 +82,12 @@ trigger_parameter_sync_step=${TRIGGER_PARAMETER_SYNC_STEP:-4}
 require_batches=${REQUIRE_BATCHES:-4}
 partial_rollout=${PARTIAL_ROLLOUT:-True}
 
+
+gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.8} 
+
+
 cd "/users/${USER}/scratch/verl"
 
-pip install "numpy==2.1.*"
-
-# rm recipe/README.md
-# git fetch upstream
-# git checkout 016c1d5a7a3f2973d68fda2f7abe5e7df9e05e00
-
-
-python3 "${REPO_ROOT}/lora/patch_vllm_decorators.py"
 
 # Keep literal quotes for Hydra so commas are treated as part of one string value.
 PYTHONUNBUFFERED=1 python -m verl.experimental.fully_async_policy.multi_tenant_main \
@@ -129,7 +125,7 @@ PYTHONUNBUFFERED=1 python -m verl.experimental.fully_async_policy.multi_tenant_m
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.lr=1e-5 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
@@ -139,7 +135,7 @@ PYTHONUNBUFFERED=1 python -m verl.experimental.fully_async_policy.multi_tenant_m
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
     actor_rollout_ref.rollout.temperature=${temperature} \
@@ -158,9 +154,8 @@ PYTHONUNBUFFERED=1 python -m verl.experimental.fully_async_policy.multi_tenant_m
     actor_rollout_ref.rollout.mode=${rollout_mode} \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.rollout.checkpoint_engine.backend='nccl' \
-    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
+    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024 \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
-    reward.reward_manager.name=dapo \
     +reward.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
     +reward.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
     +reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
