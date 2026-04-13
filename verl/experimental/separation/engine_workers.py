@@ -154,7 +154,14 @@ class DetachActorWorker(ActorRolloutRefWorker):
         lr_scheduler = self.actor.engine.lr_scheduler
         lr_state = lr_scheduler.state_dict() if lr_scheduler is not None else None
 
-        self.cpu_saved_optimizers[n] = (cpu_state, lr_state)
+        # Save per-param-group learning rates (lr and initial_lr). These live on
+        # optimizer.param_groups and are NOT part of optimizer.state, so they
+        # need to be tracked separately for per-tenant LR support.
+        param_group_lrs = [
+            {"lr": g.get("lr"), "initial_lr": g.get("initial_lr")} for g in optimizer.param_groups
+        ]
+
+        self.cpu_saved_optimizers[n] = (cpu_state, lr_state, param_group_lrs)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def restore_optimizer_from_cpu(self, n):
@@ -172,7 +179,13 @@ class DetachActorWorker(ActorRolloutRefWorker):
         if optimizer is None:
             return
 
-        cpu_state, lr_state = self.cpu_saved_optimizers[n]
+        saved = self.cpu_saved_optimizers[n]
+        # Back-compat: old saves stored 2-tuples (cpu_state, lr_state).
+        if len(saved) == 3:
+            cpu_state, lr_state, param_group_lrs = saved
+        else:
+            cpu_state, lr_state = saved
+            param_group_lrs = None
 
         # Restore optimizer state tensors to GPU
         for param, state in cpu_state.items():
@@ -192,11 +205,44 @@ class DetachActorWorker(ActorRolloutRefWorker):
                 else:
                     optimizer.state[param][k] = v
 
-        # Restore LR scheduler state
+        # Restore LR scheduler state first (so base_lrs / last_epoch are in
+        # place), then apply the saved per-param-group lr / initial_lr on top —
+        # these carry the per-tenant learning rate the next optimizer.step()
+        # will actually use.
         if lr_state is not None:
             lr_scheduler = self.actor.engine.lr_scheduler
             if lr_scheduler is not None:
                 lr_scheduler.load_state_dict(lr_state)
+
+        if param_group_lrs is not None:
+            for g, saved_g in zip(optimizer.param_groups, param_group_lrs, strict=False):
+                if saved_g.get("lr") is not None:
+                    g["lr"] = saved_g["lr"]
+                if saved_g.get("initial_lr") is not None:
+                    g["initial_lr"] = saved_g["initial_lr"]
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_learning_rate(self, lr: float):
+        """Override the optimizer's learning rate (and scheduler base_lrs).
+
+        Used in multi-tenant training to give each tenant its own LR. Affects
+        all param groups and updates scheduler.base_lrs so that subsequent
+        scheduler.step() calls decay/warmup off the new base LR.
+        """
+        optimizer = self.actor.engine.optimizer
+        if optimizer is None:
+            return
+
+        for g in optimizer.param_groups:
+            g["lr"] = lr
+            g["initial_lr"] = lr
+
+        lr_scheduler = self.actor.engine.lr_scheduler
+        if lr_scheduler is not None:
+            if hasattr(lr_scheduler, "base_lrs"):
+                lr_scheduler.base_lrs = [lr for _ in lr_scheduler.base_lrs]
+            if hasattr(lr_scheduler, "_last_lr"):
+                lr_scheduler._last_lr = [lr for _ in lr_scheduler._last_lr]
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def clear_cpu_model(self, n):
