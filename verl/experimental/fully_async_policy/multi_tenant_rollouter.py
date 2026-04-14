@@ -22,6 +22,7 @@ from verl.experimental.fully_async_policy.message_queue import MessageQueueClien
 from verl.single_controller.ray import RayWorkerGroup
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role, WorkerType
+from verl.utils.profiler import marked_timer
 
 
 @ray.remote(num_cpus=10, max_concurrency=100)
@@ -88,6 +89,7 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
 
         self.tenant_dataloaders = {}
         self.tenant_val_datasets = {}
+        self.tenant_val_dataloaders = {}
 
         for tc in self.tenant_configs:
             train_dataset = create_rl_dataset(
@@ -106,7 +108,7 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
             )
             train_sampler = create_rl_sampler(config.data, train_dataset)
 
-            # Create dataloader for this tenant
+            # Create dataloaders for this tenant
             from torchdata.stateful_dataloader import StatefulDataLoader
 
             train_dataloader = StatefulDataLoader(
@@ -117,9 +119,17 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
                 drop_last=True,
                 collate_fn=collate_fn,
             )
+            val_dataloader = StatefulDataLoader(
+                dataset=val_dataset,
+                batch_size=config.data.val_batch_size,
+                num_workers=config.data.get("dataloader_num_workers", 0),
+                drop_last=False,
+                collate_fn=collate_fn,
+            )
 
             self.tenant_dataloaders[tc.name] = train_dataloader
             self.tenant_val_datasets[tc.name] = val_dataset
+            self.tenant_val_dataloaders[tc.name] = val_dataloader
 
             print(
                 f"[MTRollouter] Created dataloader for tenant '{tc.name}': "
@@ -312,6 +322,92 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
         else:
             self.dropped_stale_samples += 1
         self.processed_sample_count += 1
+
+    def _validate_for_tenant(self, tc: TenantConfig, val_dataloader) -> dict:
+        """Run validation for a single tenant using their val_dataloader and LoRA adapter."""
+        import uuid
+        from collections import defaultdict
+
+        from verl import DataProto
+        from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+        from verl.trainer.ppo.reward import extract_reward
+
+        reward_extra_infos_dict = defaultdict(list)
+        data_source_lst = []
+        sample_uids = []
+        sample_turns = []
+
+        for test_data in val_dataloader:
+            test_batch = DataProto.from_single_dict(test_data)
+
+            if "uid" not in test_batch.non_tensor_batch:
+                test_batch.non_tensor_batch["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
+                )
+
+            test_batch = test_batch.repeat(
+                repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
+            )
+            sample_uids.extend(test_batch.non_tensor_batch["uid"])
+
+            test_gen_batch = self._get_gen_batch(test_batch)
+            test_gen_batch.meta_info = {
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "recompute_log_prob": False,
+                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                "validate": True,
+                "global_steps": self.global_steps,
+                "_lora_int_id": tc.lora_int_id,
+            }
+
+            size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+
+            test_batch = test_batch.union(test_output_gen_batch)
+            test_batch.meta_info["validate"] = True
+
+            reward_tensor, reward_extra_info = extract_reward(test_batch)
+            scores = reward_tensor.sum(-1).cpu().tolist()
+            reward_extra_infos_dict["reward"].extend(scores)
+            for key, values in reward_extra_info.items():
+                if isinstance(values, np.ndarray):
+                    reward_extra_infos_dict[key].extend(values.tolist())
+                else:
+                    reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
+
+            if "__num_turns__" in test_batch.non_tensor_batch:
+                sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
+
+            data_source_lst.append(
+                test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
+            )
+
+        data_sources = np.concatenate(data_source_lst, axis=0)
+        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+
+    def do_validate(self):
+        """Override: run per-tenant validation with each tenant's val dataset and LoRA adapter."""
+        from verl.experimental.fully_async_policy.detach_utils import ValidateMetrics
+
+        timing_raw = {}
+        all_metrics = {}
+
+        with marked_timer("rollouter/validate_time", timing_raw):
+            for tc in self.tenant_configs:
+                val_dataloader = self.tenant_val_dataloaders.get(tc.name)
+                if val_dataloader is None:
+                    print(f"[MTRollouter] No val_dataloader for tenant '{tc.name}', skipping")
+                    continue
+                print(f"[MTRollouter] Validating tenant '{tc.name}' (lora_int_id={tc.lora_int_id})")
+                tenant_metrics = self._validate_for_tenant(tc, val_dataloader)
+                for k, v in tenant_metrics.items():
+                    all_metrics[f"{tc.name}/{k}"] = v
+                print(f"[MTRollouter] Tenant '{tc.name}' val metrics: {tenant_metrics}")
+
+        return ValidateMetrics(timing_raw=timing_raw, metrics=all_metrics)
 
     async def fit(self):
         """Override: check tenant queues are set before starting."""

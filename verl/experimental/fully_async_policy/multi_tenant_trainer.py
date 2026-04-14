@@ -9,6 +9,7 @@ import logging
 import os
 import time
 from datetime import datetime
+from pprint import pprint
 from typing import Any
 
 import numpy as np
@@ -17,6 +18,7 @@ from omegaconf import OmegaConf
 
 from verl.experimental.fully_async_policy.detach_utils import (
     TenantConfig,
+    ValidateMetrics,
     assemble_batch_from_rollout_samples,
     is_system_metric,
 )
@@ -449,6 +451,39 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
             if tenant_name in self.tenant_progress_bars:
                 self.tenant_progress_bars[tenant_name].update(1)
             self.progress_bar.update(1)
+
+    async def _fit_validate(self, val_before_train=False):
+        """Override: log validation at total_fit_steps to keep wandb steps monotonic."""
+        if self.local_trigger_step != 1:
+            return
+
+        need_validate = (
+            self.config.trainer.test_freq > 0
+            and self.current_param_version % self.config.trainer.test_freq == 0
+            and self.current_param_version > 0
+        )
+        if not need_validate and not val_before_train:
+            return
+
+        val_future = self.rollouter.do_validate.remote()
+        train_val_metrics = await self._validate_process()
+        val_metrics: ValidateMetrics = ray.get(val_future)
+
+        if train_val_metrics:
+            with marked_timer("timing_s/merge_val", self.timing_raw):
+                new_metrics = self._merge_validation_results(train_val_metrics, val_metrics.metrics)
+            if new_metrics:
+                self.logger.log(data=new_metrics, step=self.total_fit_steps)
+                pprint(
+                    f"[MTTrainer][validation] total_fit_steps={self.total_fit_steps} metrics={new_metrics}"
+                )
+        else:
+            if val_metrics.metrics:
+                self.logger.log(data=val_metrics.metrics, step=self.total_fit_steps)
+                pprint(
+                    f"[MTTrainer][validation] total_fit_steps={self.total_fit_steps} metrics={val_metrics.metrics}"
+                )
+        self.logger.log(data=val_metrics.timing_raw, step=self.total_fit_steps)
 
     def _collect_metrics_from_samples(self, batch, metrics):
         """Override: add tenant info to metrics."""
