@@ -20,8 +20,8 @@ REPO_ROOT="/users/${USER}/scratch/verl"
 # LoRA config (same for all tenants)
 export LORA_RANK=${LORA_RANK:-32}
 export LORA_ALPHA=${LORA_ALPHA:-32}
-export EXP_NAME=${EXP_NAME:-'MT-DAPO-Qwen2.5-0.5b-vllm-fully-async-2-2-2tenants'}
+export EXP_NAME=${EXP_NAME:-'MT-gsm8k-0.5b-2tenants-rr'}
 export STALENESS_THRESHOLD=${STALENESS_THRESHOLD:-0.1}
 export TRIGGER_PARAMETER_SYNC_STEP=${TRIGGER_PARAMETER_SYNC_STEP:-2}
-export MODEL_PATH="Qwen/Qwen2.5-0.5B"
+export MODEL_PATH="Qwen/Qwen2.5-0.5B-Instruct"
 bash "${REPO_ROOT}/multi_tenant_run.sh" "$@"

@@ -23,7 +23,7 @@ export LORA_ALPHA=${LORA_ALPHA:-32}
 export EXP_NAME=${EXP_NAME:-'MT-DAPO-Qwen2.5-0.5b-vllm-fully-async-2-2-2tenants'}
 export STALENESS_THRESHOLD=${STALENESS_THRESHOLD:-0.1}
 export TRIGGER_PARAMETER_SYNC_STEP=${TRIGGER_PARAMETER_SYNC_STEP:-2}
-export MODEL_PATH="Qwen/Qwen2.5-0.5B"
+export MODEL_PATH="Qwen/Qwen2.5-0.5B-Instruct"
 export SCHEDULING="burst"
 
 bash "${REPO_ROOT}/multi_tenant_run.sh" "$@"

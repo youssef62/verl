@@ -119,9 +119,12 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
                 drop_last=True,
                 collate_fn=collate_fn,
             )
+            val_batch_size = config.data.val_batch_size
+            if val_batch_size is None:
+                val_batch_size = len(val_dataset)
             val_dataloader = StatefulDataLoader(
                 dataset=val_dataset,
-                batch_size=config.data.val_batch_size,
+                batch_size=val_batch_size,
                 num_workers=config.data.get("dataloader_num_workers", 0),
                 drop_last=False,
                 collate_fn=collate_fn,

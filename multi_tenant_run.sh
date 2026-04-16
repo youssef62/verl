@@ -10,7 +10,7 @@ REPO_ROOT="${REPO_ROOT:-"/users/${USER}/scratch/rl-as-a-service"}"
 MODEL_PATH=${MODEL_PATH:-"${HOME}/models/Qwen2.5-Math-7B"}
 
 # Tenant definitions: comma-separated list of "name:train_file:val_file"
-TENANTS=${TENANTS:-"alice:${HOME}/data/gsm8k/train.parquet:${HOME}/data/gsm8k/test.parquet:1e-6,bob:${HOME}/data/gsm8k/train.parquet:${HOME}/data/gsm8k/test.parquet:5e-5"}
+TENANTS=${TENANTS:-"alice:${HOME}/data/gsm8k/train.parquet:${HOME}/data/gsm8k/test.parquet:1e-5,bob:${HOME}/data/gsm8k/train.parquet:${HOME}/data/gsm8k/test.parquet:5e-5"}
 
 tenant_count=$(echo "${TENANTS}" | awk -F',' '{print NF}')
 max_loras=${MAX_LORAS:-${tenant_count}}
@@ -85,7 +85,7 @@ partial_rollout=${PARTIAL_ROLLOUT:-True}
 
 
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.8} 
-
+update_weights_bucket_megabytes=${UPDATE_WEIGHTS_BUCKET_MEGABYTES:-1024}
 
 cd "/users/${USER}/scratch/verl"
 
@@ -155,7 +155,7 @@ PYTHONUNBUFFERED=1 python -m verl.experimental.fully_async_policy.multi_tenant_m
     actor_rollout_ref.rollout.mode=${rollout_mode} \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.rollout.checkpoint_engine.backend='nccl' \
-    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024 \
+    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=${update_weights_bucket_megabytes} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     +reward.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
     +reward.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
