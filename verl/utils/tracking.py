@@ -78,7 +78,7 @@ class Tracking:
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
             entity = os.environ.get("WANDB_ENTITY", None)
             wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
-            self.logger["wandb"] = wandb
+            self.logger["wandb"] = _WandbAdapter(wandb)
 
         if "trackio" in default_backend:
             import trackio
@@ -274,6 +274,28 @@ class FileLogger:
         self.fp.close()
 
 
+class _WandbAdapter:
+    """Wraps the wandb module so metrics are logged without the `step=` parameter.
+
+    Passing `step=` to wandb.log() creates a monotonicity constraint across all callers
+    (including background threads like VllmMetricsPoller). Instead, we include `fit_step`
+    as a regular data key and let wandb auto-increment its internal step counter, which
+    is always monotonic. All metrics are associated with `fit_step` via define_metric.
+    """
+
+    def __init__(self, wandb_module):
+        self._wandb = wandb_module
+        # vllm/* overrides this with its own step_metric in VllmMetricsPoller
+        wandb_module.define_metric("fit_step")
+        wandb_module.define_metric("*", step_metric="fit_step")
+
+    def log(self, data, step):
+        self._wandb.log({"fit_step": step, **data})
+
+    def finish(self, **kwargs):
+        self._wandb.finish(**kwargs)
+
+
 class _TensorboardAdapter:
     def __init__(self, project_name, experiment_name):
         import os
@@ -426,7 +448,7 @@ class ValidationGenerationsLogger:
 
         # Update reference and log
         if wandb.run is not None:
-            wandb.log({"val/generations": new_table}, step=step)
+            wandb.log({"val/generations": new_table, "fit_step": step})
         self.validation_table = new_table
 
     def log_generations_to_swanlab(self, samples, step):
