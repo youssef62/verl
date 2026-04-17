@@ -180,4 +180,5 @@ PYTHONUNBUFFERED=1 python -m verl.experimental.fully_async_policy.multi_tenant_m
     async_training.trigger_parameter_sync_step="${trigger_parameter_sync_step}" \
     async_training.require_batches="${require_batches}" \
     async_training.partial_rollout="${partial_rollout}" \
-    actor_rollout_ref.rollout.load_format=safetensors
+    actor_rollout_ref.rollout.load_format=safetensors \
+    actor_rollout_ref.rollout.disable_log_stats=False

@@ -22,6 +22,7 @@ from verl.experimental.fully_async_policy.detach_utils import (
     assemble_batch_from_rollout_samples,
     is_system_metric,
 )
+from verl.experimental.fully_async_policy.vllm_metrics_poller import VllmMetricsPoller
 from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainerBase, TrainingStopException
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.single_controller.ray import RayWorkerGroup
@@ -268,6 +269,57 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
                     sizes[name] = s["queue_size"]
                 print(f"[MTTrainer] Waiting for samples... Queue sizes: {sizes}")
             time.sleep(0.1)
+
+    async def _start_vllm_metrics_poller(self) -> VllmMetricsPoller | None:
+        """Fetch vLLM server addresses from the rollouter and start the metrics poller.
+
+        Retries up to ~60 s in case the rollouter's _init_async_rollout_manager
+        hasn't completed yet when the trainer's fit() begins.
+
+        Returns the started poller, or None if addresses could not be obtained
+        or if vLLM stats are disabled (disable_log_stats=True).
+        """
+        # Metrics require disable_log_stats=False on the vLLM server.
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+        if getattr(rollout_cfg, "disable_log_stats", True):
+            print(
+                "[MTTrainer] vLLM metrics poller disabled: "
+                "set actor_rollout_ref.rollout.disable_log_stats=False to enable."
+            )
+            return None
+
+        import asyncio
+
+        addresses = None
+        for attempt in range(30):  # up to 30 × 2 s = 60 s
+            addresses = ray.get(self.rollouter.get_server_addresses.remote())
+            if addresses:
+                break
+            print(
+                f"[MTTrainer] Waiting for vLLM server addresses (attempt {attempt + 1}/30)..."
+            )
+            await asyncio.sleep(2.0)
+
+        if not addresses:
+            print("[MTTrainer] Could not obtain vLLM server addresses — metrics poller not started.")
+            return None
+
+        interval = float(getattr(rollout_cfg, "metrics_poll_interval_s", 5.0))
+        poller = VllmMetricsPoller(
+            server_addresses=addresses,
+            interval=interval,
+        )
+        poller.start()
+        return poller
+
+    async def fit(self):
+        """Override: start vLLM metrics poller before the training loop, stop it after."""
+        poller = await self._start_vllm_metrics_poller()
+        try:
+            await super().fit()
+        finally:
+            if poller is not None:
+                poller.stop()
 
     async def _fit_update_weights(self):
         """Override: sync the active tenant's LoRA adapter to vLLM replicas."""
