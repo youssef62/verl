@@ -26,6 +26,8 @@ lora_rank=${LORA_RANK:-32}
 lora_alpha=${LORA_ALPHA:-32}
 lora_target_modules=${LORA_TARGET_MODULES:-"all-linear"}
 
+seed=${SEED:-42}
+
 rollout_mode=${ROLLOUT_MODE:-"async"}
 rollout_name=${ROLLOUT_NAME:-"vllm"}
 
@@ -46,6 +48,7 @@ clip_ratio_high=${CLIP_RATIO_HIGH:-0.28}
 # Length parameters
 max_prompt_length=${MAX_PROMPT_LENGTH:-$((1024 * 2))}
 max_response_length=${MAX_RESPONSE_LENGTH:-$((1024 * 8))}
+max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-$((max_prompt_length + max_response_length))}
 enable_overlong_buffer=${ENABLE_OVERLONG_BUFFER:-True}
 overlong_buffer_len=${OVERLONG_BUFFER_LEN:-$((1024 * 4))}
 overlong_penalty_factor=${OVERLONG_PENALTY_FACTOR:-1.0}
@@ -106,6 +109,9 @@ PYTHONUNBUFFERED=1 python -m verl.experimental.fully_async_policy.multi_tenant_m
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     actor_rollout_ref.actor.fsdp_config.strategy=fsdp2 \
+    actor_rollout_ref.actor.fsdp_config.seed=${seed} \
+    actor_rollout_ref.actor.fsdp_config.full_determinism=True \
+    data.seed=${seed} \
     critic.strategy=fsdp2 \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
@@ -138,7 +144,7 @@ PYTHONUNBUFFERED=1 python -m verl.experimental.fully_async_policy.multi_tenant_m
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
-    actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
+    actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens} \
     actor_rollout_ref.rollout.temperature=${temperature} \
     actor_rollout_ref.rollout.top_p=${top_p} \
     actor_rollout_ref.rollout.top_k=${top_k} \

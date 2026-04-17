@@ -91,7 +91,7 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
         self.tenant_val_datasets = {}
         self.tenant_val_dataloaders = {}
 
-        for tc in self.tenant_configs:
+        for tenant_idx, tc in enumerate(self.tenant_configs):
             train_dataset = create_rl_dataset(
                 tc.train_file,
                 config.data,
@@ -106,7 +106,16 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
                 processor,
                 max_samples=config.data.get("val_max_samples", -1),
             )
-            train_sampler = create_rl_sampler(config.data, train_dataset)
+            # Give each tenant a unique seed offset so their shuffle orders diverge.
+            # Falls back to unseeded (non-deterministic) when data.seed is not set.
+            base_seed = config.data.get("seed")
+            tenant_data_config = config.data.copy() if hasattr(config.data, "copy") else config.data
+            if base_seed is not None:
+                from omegaconf import OmegaConf
+                tenant_data_config = OmegaConf.to_container(config.data, resolve=True)
+                tenant_data_config["seed"] = base_seed + tenant_idx
+                tenant_data_config = OmegaConf.create(tenant_data_config)
+            train_sampler = create_rl_sampler(tenant_data_config, train_dataset)
 
             # Create dataloaders for this tenant
             from torchdata.stateful_dataloader import StatefulDataLoader
