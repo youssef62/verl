@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=mt_dapo_7b_2tenant
+#SBATCH --job-name=mt_dapo_3b_2tenant
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --mem=200G
@@ -9,7 +9,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=64
 #SBATCH --environment=env
-#SBATCH --output=logs/multi-tenant/0.5b/mt_dapo_0.5b_2tenant_%j.out
+#SBATCH --output=logs/multi-tenant/3b/mt_dapo_3b_2tenant_%j.out
 
 
 REPO_ROOT="/users/${USER}/scratch/verl"
@@ -20,10 +20,12 @@ REPO_ROOT="/users/${USER}/scratch/verl"
 # LoRA config (same for all tenants)
 export LORA_RANK=${LORA_RANK:-32}
 export LORA_ALPHA=${LORA_ALPHA:-32}
-export EXP_NAME=${EXP_NAME:-'MT-DAPO-Qwen2.5-0.5b-vllm-fully-async-2-2-2tenants'}
-export STALENESS_THRESHOLD=${STALENESS_THRESHOLD:-0.1}
-export TRIGGER_PARAMETER_SYNC_STEP=${TRIGGER_PARAMETER_SYNC_STEP:-2}
-export MODEL_PATH="Qwen/Qwen2.5-0.5B-Instruct"
-export SCHEDULING="burst"
+export EXP_NAME=${EXP_NAME:-'MT-gsm8k-3b-1tenants-rr'}
+export STALENESS_THRESHOLD=${STALENESS_THRESHOLD:-0.0}
+export TRIGGER_PARAMETER_SYNC_STEP=${TRIGGER_PARAMETER_SYNC_STEP:-1}
+export MODEL_PATH="Qwen/Qwen2.5-3B-Instruct"
+
+export TENANTS="alice:${HOME}/data/gsm8k/train.parquet:${HOME}/data/gsm8k/test.parquet:1e-5"
+
 
 bash "${REPO_ROOT}/multi_tenant_run.sh" "$@"
