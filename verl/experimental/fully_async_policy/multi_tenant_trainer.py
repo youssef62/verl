@@ -435,6 +435,9 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         # see the correct per-tenant value.
         self.local_trigger_step = self.tenant_local_trigger_steps.get(tenant_name, 1)
         self.global_steps = self.tenant_global_steps.get(tenant_name, 1)
+        # Patch the metrics dict captured at fit_step() start — it holds self.global_steps
+        # from the previous tenant's step end, not this tenant's current step.
+        self.metrics["training/global_step"] = self.global_steps
 
         time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         print(
