@@ -24,6 +24,64 @@ from verl import DataProto
 from verl.trainer.ppo.ray_trainer import compute_response_mask
 
 
+_SYSTEM_METRIC_PREFIXES = (
+    "timing_s/",
+    "timing_per_token_ms/",
+    "perf/",
+    # Rollouter-level stats from get_statistics() — these describe the shared
+    # rollouter state across all tenants and should not be attributed to any
+    # single tenant.
+    "fully_async/monitor/",
+    "fully_async/static/",
+    "fully_async/count/staleness_",
+    "fully_async/count/total_generated_samples",
+    "fully_async/count/dropped_stale_samples",
+)
+_SYSTEM_METRIC_EXACT = {"fully_async/total_wait_time"}
+
+
+def is_system_metric(key: str) -> bool:
+    """Returns True for timing/perf metrics that should be logged per-step (system-level)."""
+    return any(key.startswith(p) for p in _SYSTEM_METRIC_PREFIXES) or key in _SYSTEM_METRIC_EXACT
+
+
+@dataclass
+class TenantConfig:
+    """Configuration for a single tenant in multi-tenant training"""
+
+    name: str
+    train_file: str
+    val_file: str
+    lora_int_id: int  # unique per tenant for vLLM multi-LoRA
+    learning_rate: float | None = None  # per-tenant LR override; None = use config default
+
+
+def parse_tenants(tenants_str: str) -> list[TenantConfig]:
+    """Parse TENANTS env var format: 'name:train_file:val_file[:lr],...'
+
+    The 4th field (learning rate) is optional. Each tenant gets a unique
+    lora_int_id starting from 1.
+    """
+    tenants = []
+    for i, entry in enumerate(tenants_str.split(",")):
+        parts = entry.strip().split(":")
+        if len(parts) not in (3, 4):
+            raise ValueError(
+                f"Invalid tenant entry '{entry}'. Expected 'name:train_file:val_file[:lr]'"
+            )
+        lr = float(parts[3]) if len(parts) == 4 and parts[3] else None
+        tenants.append(
+            TenantConfig(
+                name=parts[0],
+                train_file=parts[1],
+                val_file=parts[2],
+                lora_int_id=i + 1,  # 1-indexed to avoid 0
+                learning_rate=lr,
+            )
+        )
+    return tenants
+
+
 @dataclass
 class RolloutSample:
     """Enhanced rollout sample containing both original batch info and AgentLoopOutput"""
@@ -37,6 +95,9 @@ class RolloutSample:
 
     # Processing metadata
     rollout_status: dict[str, Any]
+
+    # Multi-tenant: which tenant this sample belongs to (None for single-tenant)
+    tenant_id: str | None = None
 
 
 @dataclass

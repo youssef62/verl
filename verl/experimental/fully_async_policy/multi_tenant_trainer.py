@@ -1,0 +1,594 @@
+"""Multi-tenant trainer that extends FullyAsyncTrainer.
+
+Polls per-tenant MessageQueues, trains whichever tenant is ready first,
+swaps LoRA adapter weights between tenants, and syncs per-tenant adapters
+to vLLM replicas.
+"""
+
+import logging
+import os
+import time
+from datetime import datetime
+from pprint import pprint
+from typing import Any
+
+import numpy as np
+import ray
+from omegaconf import OmegaConf
+
+from verl.experimental.fully_async_policy.detach_utils import (
+    TenantConfig,
+    ValidateMetrics,
+    assemble_batch_from_rollout_samples,
+    is_system_metric,
+)
+from verl.experimental.fully_async_policy.vllm_metrics_poller import VllmMetricsPoller
+from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainerBase, TrainingStopException
+from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
+from verl.single_controller.ray import RayWorkerGroup
+from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+from verl.trainer.ppo.utils import Role, WorkerType
+from verl.utils.debug import marked_timer
+
+logger = logging.getLogger(__name__)
+
+# Tenant version keys for save_model_to_cpu (high base to avoid collision with MIS correction)
+_TENANT_VERSION_BASE = 100000
+
+
+@ray.remote(num_cpus=10)
+class MultiTenantTrainer(FullyAsyncTrainerBase):
+    """Multi-tenant trainer: polls per-tenant queues, swaps adapters, per-tenant weight sync."""
+
+    def __init__(
+        self,
+        config,
+        tokenizer,
+        role_worker_mapping: dict[Role, WorkerType],
+        resource_pool_manager: ResourcePoolManager,
+        ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
+        processor=None,
+        device_name=None,
+        tenant_configs: list[TenantConfig] = None,
+    ):
+        if tenant_configs is None or len(tenant_configs) == 0:
+            raise ValueError("tenant_configs must be provided and non-empty")
+
+        self.tenant_configs = tenant_configs
+        self.tenant_lora_map = {tc.name: tc.lora_int_id for tc in tenant_configs}
+
+        # Per-tenant queue clients (set by main)
+        self.tenant_queue_clients: dict[str, MessageQueueClient] = {}
+
+        # Currently active tenant on the training GPUs
+        self.active_tenant: str | None = None
+
+        # Per-tenant training state (param versions, step counters)
+        self.tenant_param_versions: dict[str, int] = {tc.name: 0 for tc in tenant_configs}
+
+        # Per-tenant step counters (independent of other tenants)
+        self.tenant_global_steps: dict[str, int] = {tc.name: 1 for tc in tenant_configs}
+        self.tenant_local_trigger_steps: dict[str, int] = {tc.name: 1 for tc in tenant_configs}
+
+        # Track which tenant was last trained (for metrics)
+        self.last_trained_tenant: str | None = None
+
+        # Per-tenant termination tracking
+        self.tenant_terminated: dict[str, bool] = {tc.name: False for tc in tenant_configs}
+
+        super().__init__(
+            config=config,
+            tokenizer=tokenizer,
+            role_worker_mapping=role_worker_mapping,
+            resource_pool_manager=resource_pool_manager,
+            ray_worker_group_cls=ray_worker_group_cls,
+            processor=processor,
+            device_name=device_name,
+        )
+
+        # Per-tenant aggregators for data metrics (losses, scores, staleness, etc.)
+        # The parent's self.metrics_aggregator is no longer used in multi-tenant mode.
+        from verl.experimental.fully_async_policy.detach_utils import MetricsAggregator
+
+        total_gpus = (
+            config.trainer.nnodes * config.trainer.n_gpus_per_node
+            + config.rollout.nnodes * config.rollout.n_gpus_per_node
+        )
+        self.tenant_metrics_aggregators: dict[str, MetricsAggregator] = {
+            tc.name: MetricsAggregator(total_gpus=total_gpus) for tc in tenant_configs
+        }
+
+        # Shared step counter across all tenants (monotonic, for system timing x-axis)
+        self.total_fit_steps = 0
+
+        # Will be populated in set_total_train_steps
+        self.tenant_progress_bars: dict[str, Any] = {}
+
+    def set_total_train_steps(self, total_training_steps):
+        """Override: create per-tenant progress bars instead of a single global one."""
+        from tqdm import tqdm
+
+        super().set_total_train_steps(total_training_steps)
+
+        # total_training_steps is the global total across all tenants.
+        # Each tenant gets an equal share as its progress bar total.
+        n_tenants = len(self.tenant_configs)
+        per_tenant_steps = total_training_steps // n_tenants
+        for tc in self.tenant_configs:
+            self.tenant_progress_bars[tc.name] = tqdm(
+                total=per_tenant_steps,
+                initial=0,
+                desc=f"[{tc.name}]",
+            )
+
+    def set_tenant_queue_clients(self, tenant_queue_clients: dict[str, MessageQueueClient]):
+        """Set per-tenant message queue clients."""
+        self.tenant_queue_clients = tenant_queue_clients
+        # Satisfy the base-class fit() guard — multi-tenant uses per-tenant queues
+        # instead of a single message_queue_client, but the guard checks is-not-None.
+        self.message_queue_client = True
+
+    # Override: not used in multi-tenant mode
+    def set_message_queue_client(self, message_queue_client: MessageQueueClient):
+        pass
+
+    def _tenant_version_key(self, tenant_name: str) -> int:
+        """Get a unique version key for save/restore_model_to/from_cpu."""
+        idx = next(i for i, tc in enumerate(self.tenant_configs) if tc.name == tenant_name)
+        return _TENANT_VERSION_BASE + idx
+
+    def _init_tenant_model_states(self):
+        """Save the initial model and optimizer state for all tenants.
+
+        All tenants start with the same initial adapter weights (from the base model + random LoRA init).
+        We save a copy per tenant so we can swap between them later.
+        """
+        print("[MTTrainer] Initializing per-tenant model and optimizer states on CPU...")
+        for tc in self.tenant_configs:
+            key = self._tenant_version_key(tc.name)
+            # Apply per-tenant LR override BEFORE saving, so the snapshot carries
+            # the tenant's own learning rate in param_groups + scheduler base_lrs.
+            if tc.learning_rate is not None:
+                print(f"[MTTrainer] Setting tenant '{tc.name}' learning_rate={tc.learning_rate}")
+                self.actor_rollout_wg.set_learning_rate(tc.learning_rate)
+            self.actor_rollout_wg.save_model_to_cpu(key)
+            self.actor_rollout_wg.save_optimizer_to_cpu(key)
+            print(f"[MTTrainer] Saved initial state for tenant '{tc.name}'")
+
+        # Leave GPU state matching the first tenant (the one we declare active).
+        first_tenant = self.tenant_configs[0]
+        self.actor_rollout_wg.restore_model_from_cpu(self._tenant_version_key(first_tenant.name))
+        self.actor_rollout_wg.restore_optimizer_from_cpu(self._tenant_version_key(first_tenant.name))
+        self.active_tenant = first_tenant.name
+        print(f"[MTTrainer] Active tenant set to '{self.active_tenant}'")
+
+    def _switch_tenant(self, new_tenant: str):
+        """Swap LoRA adapter weights and optimizer state to a different tenant."""
+        if self.active_tenant == new_tenant:
+            return
+
+        print(f"[MTTrainer] Switching from tenant '{self.active_tenant}' to '{new_tenant}'")
+        switch_start = time.time()
+
+        # Save current tenant's model + optimizer state
+        if self.active_tenant is not None:
+            key = self._tenant_version_key(self.active_tenant)
+            self.actor_rollout_wg.save_model_to_cpu(key)
+            self.actor_rollout_wg.save_optimizer_to_cpu(key)
+
+        # Restore new tenant's model + optimizer state
+        key = self._tenant_version_key(new_tenant)
+        self.actor_rollout_wg.restore_model_from_cpu(key)
+        self.actor_rollout_wg.restore_optimizer_from_cpu(key)
+        self.active_tenant = new_tenant
+
+        switch_time = time.time() - switch_start
+        print(f"[MTTrainer] Tenant switch completed in {switch_time:.2f}s")
+
+    async def _get_samples_from_queue(self):
+        """Override: poll all tenant queues, pick the first with enough samples.
+
+        Returns:
+            tuple: (epoch, batch) or (None, None) if all tenants terminated.
+        """
+        print(
+            f"[MTTrainer] Polling {len(self.tenant_queue_clients)} tenant queues "
+            f"for {self.required_samples} samples...",
+            flush=True,
+        )
+
+        poll_start = time.time()
+        poll_count = 0
+
+        while True:
+            # Check if all tenants have terminated
+            if all(self.tenant_terminated.values()):
+                print("[MTTrainer] All tenant queues terminated")
+                return None, None
+
+            # Poll each active tenant's queue
+            for tc in self.tenant_configs:
+                if self.tenant_terminated[tc.name]:
+                    continue
+
+                queue_client = self.tenant_queue_clients[tc.name]
+                stats = queue_client.get_statistics_sync()
+                queue_size = stats["queue_size"]
+
+                if queue_size >= self.required_samples:
+                    # This tenant has enough samples — collect them
+                    print(
+                        f"[MTTrainer] Tenant '{tc.name}' ready with {queue_size} samples "
+                        f"(need {self.required_samples})"
+                    )
+
+                    # Switch to this tenant's adapter
+                    self._switch_tenant(tc.name)
+                    self.last_trained_tenant = tc.name
+
+                    # Collect samples from this tenant's queue
+                    queue_samples = []
+                    while len(queue_samples) < self.required_samples:
+                        sample, queue_len = queue_client.get_sample_sync()
+                        if sample is None:
+                            print(f"[MTTrainer] Tenant '{tc.name}' terminated during collection")
+                            self.tenant_terminated[tc.name] = True
+                            break
+                        queue_samples.append(sample)
+
+                    if len(queue_samples) < self.required_samples:
+                        print(
+                            f"[MTTrainer] Tenant '{tc.name}' didn't provide enough samples: "
+                            f"{len(queue_samples)}/{self.required_samples}"
+                        )
+                        continue
+
+                    total_wait_time = time.time() - poll_start
+
+                    queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
+                    if self.config.trainer.balance_batch:
+                        batch = assemble_batch_from_rollout_samples(
+                            queue_samples, self.tokenizer, self.config, self._balance_batch
+                        )
+                    else:
+                        batch = assemble_batch_from_rollout_samples(
+                            queue_samples, self.tokenizer, self.config, None
+                        )
+
+                    batch.meta_info["fully_async/total_wait_time"] = total_wait_time
+                    batch.meta_info["fully_async/active_tenant"] = tc.name
+                    return 0, batch
+
+            # No tenant ready yet, brief sleep before retrying
+            poll_count += 1
+            if poll_count % 100 == 0:
+                active_tenants = [tc.name for tc in self.tenant_configs if not self.tenant_terminated[tc.name]]
+                sizes = {}
+                for name in active_tenants:
+                    s = self.tenant_queue_clients[name].get_statistics_sync()
+                    sizes[name] = s["queue_size"]
+                print(f"[MTTrainer] Waiting for samples... Queue sizes: {sizes}")
+            time.sleep(0.1)
+
+    async def _start_vllm_metrics_poller(self) -> VllmMetricsPoller | None:
+        """Fetch vLLM server addresses from the rollouter and start the metrics poller.
+
+        Retries up to ~60 s in case the rollouter's _init_async_rollout_manager
+        hasn't completed yet when the trainer's fit() begins.
+
+        Returns the started poller, or None if addresses could not be obtained
+        or if vLLM stats are disabled (disable_log_stats=True).
+        """
+        # Metrics require disable_log_stats=False on the vLLM server.
+        rollout_cfg = self.config.actor_rollout_ref.rollout
+        if getattr(rollout_cfg, "disable_log_stats", True):
+            print(
+                "[MTTrainer] vLLM metrics poller disabled: "
+                "set actor_rollout_ref.rollout.disable_log_stats=False to enable."
+            )
+            return None
+
+        import asyncio
+
+        addresses = None
+        for attempt in range(30):  # up to 30 × 2 s = 60 s
+            addresses = ray.get(self.rollouter.get_server_addresses.remote())
+            if addresses:
+                break
+            print(
+                f"[MTTrainer] Waiting for vLLM server addresses (attempt {attempt + 1}/30)..."
+            )
+            await asyncio.sleep(2.0)
+
+        if not addresses:
+            print("[MTTrainer] Could not obtain vLLM server addresses — metrics poller not started.")
+            return None
+
+        interval = float(getattr(rollout_cfg, "metrics_poll_interval_s", 5.0))
+        poller = VllmMetricsPoller(
+            server_addresses=addresses,
+            interval=interval,
+        )
+        poller.start()
+        return poller
+
+    async def fit(self):
+        """Override: start vLLM metrics poller before the training loop, stop it after."""
+        poller = await self._start_vllm_metrics_poller()
+        try:
+            await super().fit()
+        finally:
+            if poller is not None:
+                poller.stop()
+
+    async def _fit_update_weights(self):
+        """Override: sync the active tenant's LoRA adapter to vLLM replicas."""
+        if self.local_trigger_step != 1:
+            return
+
+        if self.active_tenant is None:
+            # No active tenant yet (called during startup before init_tenant_adapters_on_rollout).
+            # Still do the base-model NCCL weight sync so vLLM's global_steps is initialized
+            # to a non-None value — otherwise the first generated samples would carry
+            # global_steps=None and crash assemble_batch_from_rollout_samples.
+            await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
+            return
+
+        tenant_name = self.active_tenant
+        lora_int_id = self.tenant_lora_map[tenant_name]
+
+        with marked_timer("timing_s/param_sync", self.timing_raw):
+            # First: do the base model NCCL sync (same for all tenants, effectively a no-op for LoRA)
+            await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
+
+            # Second: extract and sync this tenant's LoRA adapter to vLLM replicas
+            await self._sync_tenant_lora_to_rollout(tenant_name)
+
+        print(
+            f"[MTTrainer] _fit_update_weights for tenant '{tenant_name}' (lora_int_id={lora_int_id}), "
+            f"timing_s/param_sync: {self.timing_raw['timing_s/param_sync']:.4f}s "
+            f"current_param_version: {self.current_param_version}"
+        )
+
+        # Update tenant-specific param version
+        self.tenant_param_versions[tenant_name] = self.current_param_version
+
+        # Rollouter staleness metrics (system-level, logged at total_fit_steps to keep
+        # wandb steps monotonically increasing — all logs use the same step counter)
+        timing_raw = ray.get(self.rollouter.reset_staleness.remote(tenant_name))
+        self.logger.log(data=timing_raw, step=self.total_fit_steps)
+
+        # Per-tenant data metrics: flush aggregator, prefix with tenant name.
+        # Include tenant's own global_step as a metric so it's visible in wandb,
+        # but log at total_fit_steps to avoid wandb step-ordering warnings.
+        if tenant_name in self.tenant_metrics_aggregators:
+            tenant_agg = self.tenant_metrics_aggregators[tenant_name].get_aggregated_metrics()
+            prefixed = {f"{tenant_name}/{k}": v for k, v in tenant_agg.items()}
+            prefixed[f"{tenant_name}/active_tenant_lora_id"] = lora_int_id
+            self.logger.log(data=prefixed, step=self.total_fit_steps)
+            self.tenant_metrics_aggregators[tenant_name].reset()
+
+    async def _sync_tenant_lora_to_rollout(self, tenant_name: str):
+        """Extract the current LoRA adapter and send it to vLLM replicas for this tenant."""
+        lora_int_id = self.tenant_lora_map[tenant_name]
+
+        # Extract LoRA weights from the training model (runs on all workers, take rank 0's result)
+        results = self.actor_rollout_wg.get_lora_adapter_weights()
+        lora_state_dict, peft_config = results[0]
+
+        if lora_state_dict is None:
+            print(f"[MTTrainer] Warning: no LoRA adapter found for tenant '{tenant_name}'")
+            return
+
+        print(
+            f"[MTTrainer] Syncing LoRA adapter for tenant '{tenant_name}' "
+            f"(lora_int_id={lora_int_id}, {len(lora_state_dict)} params) to vLLM replicas"
+        )
+
+        # Get vLLM server handles from the rollouter's replicas
+        replicas = ray.get(self.rollouter.get_replicas.remote())
+        sync_futures = []
+        for replica in replicas:
+            sync_futures.append(
+                replica.server_handle.add_tenant_lora.remote(lora_int_id, peft_config, lora_state_dict)
+            )
+
+        ray.get(sync_futures)
+        print(f"[MTTrainer] LoRA sync complete for tenant '{tenant_name}'")
+
+    async def init_tenant_adapters_on_rollout(self):
+        """Initialize all tenant LoRA adapters on vLLM replicas.
+
+        Called once at startup after the base model is synced. Each tenant gets the
+        same initial adapter weights (the model's initial LoRA state).
+        """
+        # Also initialize per-tenant model states on CPU
+        self._init_tenant_model_states()
+
+        # Extract initial LoRA weights (same for all tenants)
+        results = self.actor_rollout_wg.get_lora_adapter_weights()
+        lora_state_dict, peft_config = results[0]
+
+        if lora_state_dict is None:
+            print("[MTTrainer] Warning: no LoRA adapter found — multi-tenant requires LoRA")
+            return
+
+        replicas = ray.get(self.rollouter.get_replicas.remote())
+
+        for tc in self.tenant_configs:
+            print(f"[MTTrainer] Loading initial LoRA for tenant '{tc.name}' (lora_int_id={tc.lora_int_id})")
+            sync_futures = []
+            for replica in replicas:
+                sync_futures.append(
+                    replica.server_handle.add_tenant_lora.remote(tc.lora_int_id, peft_config, lora_state_dict)
+                )
+            ray.get(sync_futures)
+
+        print(f"[MTTrainer] All {len(self.tenant_configs)} tenant LoRA adapters initialized on vLLM")
+
+    def _fit_update_local_step(self):
+        """Override: per-tenant local_trigger_step and global_steps tracking."""
+        tenant_name = self.active_tenant or "unknown"
+
+        # Restore this tenant's counters into the shared base-class fields so that
+        # _fit_update_weights / _fit_validate (which check self.local_trigger_step)
+        # see the correct per-tenant value.
+        self.local_trigger_step = self.tenant_local_trigger_steps.get(tenant_name, 1)
+        self.global_steps = self.tenant_global_steps.get(tenant_name, 1)
+        # Patch the metrics dict captured at fit_step() start — it holds self.global_steps
+        # from the previous tenant's step end, not this tenant's current step.
+        self.metrics["training/global_step"] = self.global_steps
+
+        time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        print(
+            f"[FullyAsyncTrainer][tenant={tenant_name}] global_steps: {self.global_steps} "
+            f"local_trigger_step: {self.local_trigger_step} "
+            f"trigger_parameter_sync_step: {self.trigger_parameter_sync_step} "
+            f"{time_str}"
+        )
+
+        if self.local_trigger_step < self.trigger_parameter_sync_step:
+            self.local_trigger_step += 1
+        else:
+            self.current_param_version += 1
+            self.local_trigger_step = 1
+
+        self.tenant_local_trigger_steps[tenant_name] = self.local_trigger_step
+
+    def _fit_postprocess_step(self):
+        """Override: split metrics into system (timing) and per-tenant (data).
+
+        System metrics (timing_s/*, perf/*) are logged every step at total_fit_steps.
+        Per-tenant data metrics (critic/*, actor/*, staleness) go to per-tenant aggregators,
+        flushed when that tenant hits param_sync in _fit_update_weights.
+        """
+        tenant_name = self.active_tenant or "unknown"
+        self.total_fit_steps += 1
+
+        # Split metrics into system (timing/perf) vs per-tenant (data)
+        system_metrics = {}
+        tenant_data_metrics = {}
+        for key, value in self.metrics.items():
+            if not isinstance(value, (int, float, np.number)):
+                continue  # skip string metrics like active_tenant
+            if is_system_metric(key):
+                system_metrics[key] = value
+            else:
+                tenant_data_metrics[key] = value
+
+        # Compute idle_ratio inline (previously done by MetricsAggregator._special_metrics_aggregate)
+        if "timing_s/gen" in system_metrics and "timing_s/step" in system_metrics:
+            step_time = system_metrics["timing_s/step"]
+            if step_time > 0:
+                system_metrics["fully_async/trainer/idle_ratio"] = (
+                    system_metrics["timing_s/gen"] / step_time
+                )
+
+        # Log system timing metrics immediately (every step, no aggregation)
+        self.logger.log(data=system_metrics, step=self.total_fit_steps)
+
+        # Route data metrics to per-tenant aggregator
+        if tenant_name in self.tenant_metrics_aggregators:
+            self.tenant_metrics_aggregators[tenant_name].add_step_metrics(
+                metrics=tenant_data_metrics,
+                sample_count=self.required_samples,
+                timestamp=time.time(),
+            )
+
+        # Increment per-tenant global_steps
+        if tenant_name in self.tenant_global_steps:
+            self.tenant_global_steps[tenant_name] += 1
+            self.global_steps = self.tenant_global_steps[tenant_name]
+        else:
+            self.global_steps += 1
+
+        if self.local_trigger_step == 1:
+            if tenant_name in self.tenant_progress_bars:
+                self.tenant_progress_bars[tenant_name].update(1)
+            self.progress_bar.update(1)
+
+    async def _fit_validate(self, val_before_train=False):
+        """Override: log validation at total_fit_steps to keep wandb steps monotonic."""
+        if self.local_trigger_step != 1:
+            return
+
+        need_validate = (
+            self.config.trainer.test_freq > 0
+            and self.current_param_version % self.config.trainer.test_freq == 0
+            and self.current_param_version > 0
+        )
+        if not need_validate and not val_before_train:
+            return
+
+        val_future = self.rollouter.do_validate.remote()
+        train_val_metrics = await self._validate_process()
+        val_metrics: ValidateMetrics = ray.get(val_future)
+
+        if train_val_metrics:
+            with marked_timer("timing_s/merge_val", self.timing_raw):
+                new_metrics = self._merge_validation_results(train_val_metrics, val_metrics.metrics)
+            if new_metrics:
+                self.logger.log(data=new_metrics, step=self.total_fit_steps)
+                pprint(
+                    f"[MTTrainer][validation] total_fit_steps={self.total_fit_steps} metrics={new_metrics}"
+                )
+        else:
+            if val_metrics.metrics:
+                self.logger.log(data=val_metrics.metrics, step=self.total_fit_steps)
+                pprint(
+                    f"[MTTrainer][validation] total_fit_steps={self.total_fit_steps} metrics={val_metrics.metrics}"
+                )
+        self.logger.log(data=val_metrics.timing_raw, step=self.total_fit_steps)
+
+    def _collect_metrics_from_samples(self, batch, metrics):
+        """Override: add tenant info to metrics."""
+        super()._collect_metrics_from_samples(batch, metrics)
+        if hasattr(batch, "meta_info") and batch.meta_info:
+            tenant_name = batch.meta_info.get("fully_async/active_tenant")
+            if tenant_name:
+                metrics["fully_async/active_tenant"] = tenant_name
+                metrics["fully_async/active_tenant_lora_id"] = self.tenant_lora_map.get(tenant_name, -1)
+
+    def _save_checkpoint(self):
+        """Override: save per-tenant checkpoints."""
+        for tc in self.tenant_configs:
+            local_global_step_folder = os.path.join(
+                self.config.trainer.default_local_dir,
+                tc.name,
+                f"global_step_{self.tenant_param_versions[tc.name]}",
+            )
+            actor_local_path = os.path.join(local_global_step_folder, "actor")
+
+            # Switch to this tenant's adapter before saving
+            self._switch_tenant(tc.name)
+
+            max_actor_ckpt_to_keep = self.config.trainer.get("max_actor_ckpt_to_keep", None)
+            self.actor_rollout_wg.save_checkpoint(
+                actor_local_path,
+                None,
+                self.tenant_param_versions[tc.name],
+                max_ckpt_to_keep=max_actor_ckpt_to_keep,
+            )
+            print(f"[MTTrainer] Saved checkpoint for tenant '{tc.name}' at {actor_local_path}")
+
+        # Save critic (shared across tenants)
+        if self.use_critic:
+            critic_folder = os.path.join(
+                self.config.trainer.default_local_dir, f"global_step_{self.current_param_version}"
+            )
+            critic_local_path = os.path.join(critic_folder, str(Role.Critic))
+            max_critic_ckpt_to_keep = self.config.trainer.get("max_critic_ckpt_to_keep", None)
+            self.critic_wg.save_checkpoint(
+                critic_local_path, None, self.current_param_version, max_ckpt_to_keep=max_critic_ckpt_to_keep
+            )
+
+        # Save rollouter dataloader state
+        global_step_folder = os.path.join(
+            self.config.trainer.default_local_dir, f"global_step_{self.current_param_version}"
+        )
+        ray.get(self.rollouter.save_checkpoint.remote(global_step_folder))
+
+        # Write latest checkpoint marker
+        local_latest = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
+        with open(local_latest, "w") as f:
+            f.write(str(self.current_param_version))

@@ -39,8 +39,7 @@ from verl.utils.profiler import marked_timer
 from verl.utils.tracking import ValidationGenerationsLogger
 
 
-@ray.remote(num_cpus=10, max_concurrency=100)
-class FullyAsyncRollouter(SeparateRayPPOTrainer):
+class FullyAsyncRolllouterBase(SeparateRayPPOTrainer):
     """
     Asynchronous sample generator, responsible for continuously generating training samples
     and putting them into MessageQueue
@@ -227,6 +226,16 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     def get_replicas(self):
         """Get rollout worker group"""
         return self.async_rollout_manager.rollout_replicas
+
+    def get_server_addresses(self) -> list[str] | None:
+        """Return vLLM HTTP server addresses (host:port) for all replicas.
+
+        Returns None if the async rollout manager has not been initialised yet
+        (i.e. the rollouter's fit() has not reached _init_async_rollout_manager).
+        """
+        if self.async_rollout_manager is None:
+            return None
+        return list(self.async_rollout_manager.server_addresses)
 
     def get_max_queue_size(self):
         return self.max_queue_size
@@ -685,3 +694,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         }
 
         return stats
+
+
+# Ray actor wrapper — existing code uses FullyAsyncRollouter.remote(...)
+FullyAsyncRollouter = ray.remote(num_cpus=10, max_concurrency=100)(FullyAsyncRolllouterBase)

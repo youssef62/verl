@@ -1,0 +1,27 @@
+#!/bin/bash
+#SBATCH --job-name=mt_dapo_3b_2tenant
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --mem=200G
+#SBATCH --partition=debug
+#SBATCH --time=01:00:00
+#SBATCH --account=infra01
+#SBATCH --gpus-per-node=4
+#SBATCH --cpus-per-task=64
+#SBATCH --environment=env
+#SBATCH --output=logs/multi-tenant/3b/mt_dapo_3b_2tenant_%j.out
+
+
+REPO_ROOT="/users/${USER}/scratch/verl"
+
+# Tenant definitions: name:train_file:val_file (comma-separated)
+# export TENANTS="alice:${HOME}/data/alice_train.parquet:${HOME}/data/alice_val.parquet,bob:${HOME}/data/bob_train.parquet:${HOME}/data/bob_val.parquet"
+
+# LoRA config (same for all tenants)
+export LORA_RANK=${LORA_RANK:-32}
+export LORA_ALPHA=${LORA_ALPHA:-32}
+export EXP_NAME=${EXP_NAME:-'MT-gsm8k-3b-2tenants-rr'}
+export STALENESS_THRESHOLD=${STALENESS_THRESHOLD:-0.0}
+export TRIGGER_PARAMETER_SYNC_STEP=${TRIGGER_PARAMETER_SYNC_STEP:-1}
+export MODEL_PATH="Qwen/Qwen2.5-3B-Instruct"
+bash "${REPO_ROOT}/multi_tenant_run.sh" "$@"
