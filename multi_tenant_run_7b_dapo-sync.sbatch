@@ -20,7 +20,7 @@ REPO_ROOT="/users/${USER}/scratch/verl"
 # LoRA config (same for all tenants)
 export LORA_RANK=${LORA_RANK:-32}
 export LORA_ALPHA=${LORA_ALPHA:-32}
-export EXP_NAME=${EXP_NAME:-'MT-gsm8k-7b-2tenants-sync'}
+export EXP_NAME=${EXP_NAME:-'MT-dapo-7b-2tenants-sync'}
 export STALENESS_THRESHOLD=${STALENESS_THRESHOLD:-0}
 export TRIGGER_PARAMETER_SYNC_STEP=${TRIGGER_PARAMETER_SYNC_STEP:-1}
 export MODEL_PATH="Qwen/Qwen2.5-7B-Instruct"

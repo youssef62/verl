@@ -104,6 +104,10 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         # Will be populated in set_total_train_steps
         self.tenant_progress_bars: dict[str, Any] = {}
 
+        # Cached PEFT config — populated in init_tenant_adapters_on_rollout so the
+        # per-tenant NCCL LoRA sync (in _fit_update_weights) can pass it to vLLM.
+        self._peft_config: dict | None = None
+
     def set_total_train_steps(self, total_training_steps):
         """Override: create per-tenant progress bars instead of a single global one."""
         from tqdm import tqdm
@@ -322,7 +326,12 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
                 poller.stop()
 
     async def _fit_update_weights(self):
-        """Override: sync the active tenant's LoRA adapter to vLLM replicas."""
+        """Override: sync the active tenant's LoRA adapter to vLLM replicas.
+
+        Uses the NCCL checkpoint-engine path with per-tenant ``lora_int_id`` plumbed
+        through, so the active tenant's adapter lands directly in its own vLLM slot
+        in a single fast transfer (no Ray-RPC + cloudpickle round trip).
+        """
         if self.local_trigger_step != 1:
             return
 
@@ -338,11 +347,11 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         lora_int_id = self.tenant_lora_map[tenant_name]
 
         with marked_timer("timing_s/param_sync", self.timing_raw):
-            # First: do the base model NCCL sync (same for all tenants, effectively a no-op for LoRA)
-            await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
-
-            # Second: extract and sync this tenant's LoRA adapter to vLLM replicas
-            await self._sync_tenant_lora_to_rollout(tenant_name)
+            await self.checkpoint_manager.update_weights(
+                global_steps=self.current_param_version,
+                lora_int_id=lora_int_id,
+                peft_config=self._peft_config,
+            )
 
         print(
             f"[MTTrainer] _fit_update_weights for tenant '{tenant_name}' (lora_int_id={lora_int_id}), "
@@ -368,40 +377,12 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
             self.logger.log(data=prefixed, step=self.total_fit_steps)
             self.tenant_metrics_aggregators[tenant_name].reset()
 
-    async def _sync_tenant_lora_to_rollout(self, tenant_name: str):
-        """Extract the current LoRA adapter and send it to vLLM replicas for this tenant."""
-        lora_int_id = self.tenant_lora_map[tenant_name]
-
-        # Extract LoRA weights from the training model (runs on all workers, take rank 0's result)
-        results = self.actor_rollout_wg.get_lora_adapter_weights()
-        lora_state_dict, peft_config = results[0]
-
-        if lora_state_dict is None:
-            print(f"[MTTrainer] Warning: no LoRA adapter found for tenant '{tenant_name}'")
-            return
-
-        print(
-            f"[MTTrainer] Syncing LoRA adapter for tenant '{tenant_name}' "
-            f"(lora_int_id={lora_int_id}, {len(lora_state_dict)} params) to vLLM replicas"
-        )
-
-        # Get vLLM server handles from the rollouter's replicas
-        replicas = ray.get(self.rollouter.get_replicas.remote())
-        sync_futures = []
-        for replica in replicas:
-            sync_futures.append(
-                replica.server_handle.add_tenant_lora.remote(lora_int_id, peft_config, lora_state_dict)
-            )
-
-        ray.get(sync_futures)
-        print(f"[MTTrainer] LoRA sync complete for tenant '{tenant_name}'")
-
     async def init_tenant_adapters_on_rollout(self):
         """Initialize all tenant LoRA adapters on vLLM replicas.
 
         Called once at startup after the base model is synced. Each tenant gets the
         same initial adapter weights (the model's initial LoRA state).
-        """
+        """ 
         # Also initialize per-tenant model states on CPU
         self._init_tenant_model_states()
 
@@ -412,6 +393,9 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         if lora_state_dict is None:
             print("[MTTrainer] Warning: no LoRA adapter found — multi-tenant requires LoRA")
             return
+
+        # Cache for the per-step NCCL LoRA sync path in _fit_update_weights.
+        self._peft_config = peft_config
 
         replicas = ray.get(self.rollouter.get_replicas.remote())
 

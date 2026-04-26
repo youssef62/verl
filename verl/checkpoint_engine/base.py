@@ -283,9 +283,20 @@ class CheckpointEngineWorker(Worker):
         initialize_global_process_group_ray(timeout_second=None, backend="cpu:gloo")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    async def update_weights(self, global_steps: int = None):
+    async def update_weights(
+        self,
+        global_steps: int = None,
+        lora_int_id: int = None,
+        peft_config: dict = None,
+    ):
         weights = self.checkpoint_engine.receive_weights()
-        await self.server_adapter.update_weights(weights, global_steps=global_steps)
+        extra = {}
+        if peft_config is not None:
+            extra["peft_config"] = peft_config
+            extra["base_sync_done"] = True
+        if lora_int_id is not None:
+            extra["lora_int_id"] = lora_int_id
+        await self.server_adapter.update_weights(weights, global_steps=global_steps, **extra)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
@@ -399,16 +410,30 @@ class CheckpointEngineManager:
         await asyncio.gather(*[r.sleep() for r in self.replicas])
 
     @auto_await
-    async def update_weights(self, global_steps: int = None):
+    async def update_weights(
+        self,
+        global_steps: int = None,
+        lora_int_id: int = None,
+        peft_config: dict = None,
+    ):
         """Update weights from trainer to rollout replicas.
 
         Args:
             global_steps: The global steps of the trainer.
+            lora_int_id: If set, ship LoRA-only adapter weights and load them into this
+                slot on the vLLM workers (used by multi-tenant per-tenant adapter sync).
+                When None, behaves as a full base-model weight update (single-tenant path).
+            peft_config: PEFT config dict required when ``lora_int_id`` is set so the
+                rollout side can construct a ``TensorLoRARequest``.
         """
+
+        lora_mode = lora_int_id is not None
+        if lora_mode and peft_config is None:
+            raise ValueError("peft_config is required when lora_int_id is set")
 
         # 0. update weights for sync training with colocated trainer and rollout
         if self.backend == "naive":
-            ray.get(self.trainer.update_weights(global_steps=global_steps))
+            ray.get(self.trainer.update_weights(global_steps=global_steps, lora_only=lora_mode))
             return
 
         # 1. abort and save all unfinished requests for partial rollout
@@ -425,7 +450,14 @@ class CheckpointEngineManager:
         self.build_process_group(rollout)
 
         # 4. update weights of all workers
-        ray.get(trainer.update_weights(global_steps=global_steps) + rollout.update_weights(global_steps=global_steps))
+        rollout_kwargs = {"global_steps": global_steps}
+        if lora_mode:
+            rollout_kwargs["lora_int_id"] = lora_int_id
+            rollout_kwargs["peft_config"] = peft_config
+        ray.get(
+            trainer.update_weights(global_steps=global_steps, lora_only=lora_mode)
+            + rollout.update_weights(**rollout_kwargs)
+        )
 
         # 5. finalize all workers
         ray.get(
