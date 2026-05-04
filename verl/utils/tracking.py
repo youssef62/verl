@@ -277,15 +277,14 @@ class FileLogger:
 class _WandbAdapter:
     """Wraps the wandb module so metrics are logged without the `step=` parameter.
 
-    Passing `step=` to wandb.log() creates a monotonicity constraint across all callers
-    (including background threads like VllmMetricsPoller). Instead, we include `fit_step`
-    as a regular data key and let wandb auto-increment its internal step counter, which
-    is always monotonic. All metrics are associated with `fit_step` via define_metric.
+    Passing `step=` to wandb.log() creates a monotonicity constraint across all callers.
+    Instead, we include `fit_step` as a regular data key and let wandb auto-increment its
+    internal step counter, which is always monotonic. All metrics are associated with
+    `fit_step` via define_metric.
     """
 
     def __init__(self, wandb_module):
         self._wandb = wandb_module
-        # vllm/* overrides this with its own step_metric in VllmMetricsPoller
         wandb_module.define_metric("fit_step")
         wandb_module.define_metric("*", step_metric="fit_step")
 
