@@ -89,12 +89,12 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         # The parent's self.metrics_aggregator is no longer used in multi-tenant mode.
         from verl.experimental.fully_async_policy.detach_utils import MetricsAggregator
 
-        total_gpus = (
+        self._total_gpus = (
             config.trainer.nnodes * config.trainer.n_gpus_per_node
             + config.rollout.nnodes * config.rollout.n_gpus_per_node
         )
         self.tenant_metrics_aggregators: dict[str, MetricsAggregator] = {
-            tc.name: MetricsAggregator(total_gpus=total_gpus) for tc in tenant_configs
+            tc.name: MetricsAggregator(total_gpus=self._total_gpus) for tc in tenant_configs
         }
 
         # Shared step counter across all tenants (monotonic, for system timing x-axis)
@@ -414,6 +414,17 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
             if step_time > 0:
                 system_metrics["fully_async/trainer/idle_ratio"] = (
                     system_metrics["timing_s/gen"] / step_time
+                )
+
+        # Recompute throughput against full (trainer + rollout) GPU count, mirroring
+        # MetricsAggregator._special_metrics_aggergate. compute_throughout_metrics uses
+        # resource_pool_manager.get_n_gpus(), which only counts trainer GPUs in the
+        # detached-rollout setup and inflates the value.
+        if {"perf/throughput", "perf/total_num_tokens", "perf/time_per_step"}.issubset(system_metrics):
+            t = system_metrics["perf/time_per_step"]
+            if t > 0:
+                system_metrics["perf/throughput"] = system_metrics["perf/total_num_tokens"] / (
+                    t * self._total_gpus
                 )
 
         # Log system timing metrics immediately (every step, no aggregation)
