@@ -165,13 +165,6 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
     async def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         pass  # Not used in multi-tenant mode
 
-    async def set_max_required_samples(self):
-        await super().set_max_required_samples()
-        async with self.lock:
-            n = len(self.tenant_configs)
-            self.max_concurrent_samples = min(self.max_concurrent_samples * n, self.max_required_samples * n)
-            print(f"[MTRollouter] Scaled max_concurrent_samples to {self.max_concurrent_samples} ({n} tenants)")
-
     def _advance_burst_index(self, active_tenants: list[TenantConfig]):
         """Advance burst focus to the next active tenant (circular)."""
         active_names = {tc.name for tc in active_tenants}
