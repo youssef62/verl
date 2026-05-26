@@ -229,6 +229,11 @@ class DetachActorWorker(ActorRolloutRefWorker):
         all param groups and updates scheduler.base_lrs so that subsequent
         scheduler.step() calls decay/warmup off the new base LR.
         """
+        # dispatch_one_to_all wraps scalar args as [val]*world_size; unwrap.
+        if isinstance(lr, (list, tuple)):
+            lr = lr[0]
+        lr = float(lr)
+
         optimizer = self.actor.engine.optimizer
         if optimizer is None:
             return

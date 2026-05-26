@@ -42,9 +42,15 @@ class MultiTenantTaskRunner:
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
-        # Parse tenant configurations
-        tenants_str = config.multi_tenant.tenants
-        tenant_configs = parse_tenants(tenants_str)
+        # Parse tenant configurations — either from a YAML file path or an inline string/list
+        config_path = config.multi_tenant.get("config_path")
+        if config_path:
+            import yaml
+            with open(config_path) as f:
+                tenants_cfg = yaml.safe_load(f)["tenants"]
+        else:
+            tenants_cfg = config.multi_tenant.tenants
+        tenant_configs = parse_tenants(tenants_cfg)
         self.components["tenant_configs"] = tenant_configs
         print(f"[MT MAIN] Parsed {len(tenant_configs)} tenants: {[t.name for t in tenant_configs]}")
 
@@ -209,8 +215,12 @@ def main(config):
 
     assert config.async_training.use_trainer_do_validate is False, "use_trainer_do_validate is not ready to use."
 
-    if not hasattr(config, "multi_tenant") or not config.multi_tenant.get("tenants"):
-        raise RuntimeError("must set multi_tenant.tenants config (e.g. 'alice:train.parquet:val.parquet,bob:...')")
+    if not hasattr(config, "multi_tenant") or (
+        not config.multi_tenant.get("tenants") and not config.multi_tenant.get("config_path")
+    ):
+        raise RuntimeError(
+            "must set multi_tenant.tenants or multi_tenant.config_path config"
+        )
 
     from time import time
 

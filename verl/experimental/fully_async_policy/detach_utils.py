@@ -54,29 +54,75 @@ class TenantConfig:
     val_file: str
     lora_int_id: int  # unique per tenant for vLLM multi-LoRA
     learning_rate: float | None = None  # per-tenant LR override; None = use config default
+    max_response_length: int | None = None  # per-tenant generation length; None = use config default
 
 
-def parse_tenants(tenants_str: str) -> list[TenantConfig]:
-    """Parse TENANTS env var format: 'name:train_file:val_file[:lr],...'
+def parse_tenants(tenants_cfg) -> list[TenantConfig]:
+    """Parse tenant configuration from either a YAML list or a legacy colon-string.
 
-    The 4th field (learning rate) is optional. Each tenant gets a unique
-    lora_int_id starting from 1.
+    YAML list format (preferred, via Hydra config group +multi_tenant=<name>):
+        tenants:
+          - name: alice
+            train_file: /data/alice_train.parquet
+            val_file: /data/alice_val.parquet
+            learning_rate: 1e-5          # optional
+            max_response_length: 4096    # optional
+
+    Legacy string format (backward-compatible, via TENANTS env var):
+        'name:train_file:val_file[:lr[:max_response_length]],...'
+
+    Each tenant gets a unique lora_int_id starting from 1.
     """
+    if isinstance(tenants_cfg, str):
+        return _parse_tenants_str(tenants_cfg)
+    return _parse_tenants_list(tenants_cfg)
+
+
+def _parse_tenants_str(tenants_str: str) -> list[TenantConfig]:
+    """Parse legacy colon-delimited tenant string."""
     tenants = []
     for i, entry in enumerate(tenants_str.split(",")):
         parts = entry.strip().split(":")
-        if len(parts) not in (3, 4):
+        if len(parts) not in (3, 4, 5):
             raise ValueError(
-                f"Invalid tenant entry '{entry}'. Expected 'name:train_file:val_file[:lr]'"
+                f"Invalid tenant entry '{entry}'. Expected 'name:train_file:val_file[:lr[:max_response_length]]'"
             )
-        lr = float(parts[3]) if len(parts) == 4 and parts[3] else None
+        lr = float(parts[3]) if len(parts) >= 4 and parts[3] else None
+        max_resp_len = int(parts[4]) if len(parts) == 5 and parts[4] else None
         tenants.append(
             TenantConfig(
                 name=parts[0],
                 train_file=parts[1],
                 val_file=parts[2],
-                lora_int_id=i + 1,  # 1-indexed to avoid 0
+                lora_int_id=i + 1,
                 learning_rate=lr,
+                max_response_length=max_resp_len,
+            )
+        )
+    return tenants
+
+
+def _parse_tenants_list(tenants_list) -> list[TenantConfig]:
+    """Parse a list of tenant dicts (from a Hydra YAML config group)."""
+    tenants = []
+    for i, entry in enumerate(tenants_list):
+        if isinstance(entry, dict):
+            d = entry
+        else:
+            from omegaconf import OmegaConf
+            d = OmegaConf.to_container(entry, resolve=True)
+        required = {"name", "train_file", "val_file"}
+        missing = required - d.keys()
+        if missing:
+            raise ValueError(f"Tenant entry {i} missing required fields: {missing}")
+        tenants.append(
+            TenantConfig(
+                name=d["name"],
+                train_file=d["train_file"],
+                val_file=d["val_file"],
+                lora_int_id=i + 1,
+                learning_rate=d.get("learning_rate"),
+                max_response_length=d.get("max_response_length"),
             )
         )
     return tenants

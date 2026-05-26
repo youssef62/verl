@@ -222,6 +222,8 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
         """Prepare and enqueue a single rollout sample. Returns False if total steps reached."""
         full_batch = prepare_single_generation_data(batch_dict, self.config)
         full_batch.meta_info["_lora_int_id"] = tc.lora_int_id
+        if tc.max_response_length is not None:
+            full_batch.meta_info["_max_response_length"] = tc.max_response_length
         sample_id = f"sample_{tc.name}_{epoch}_{self.global_steps}"
         rollout_sample = RolloutSample(
             full_batch=full_batch,

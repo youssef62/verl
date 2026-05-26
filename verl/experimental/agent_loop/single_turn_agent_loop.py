@@ -49,6 +49,12 @@ class SingleTurnAgentLoop(AgentLoopBase):
         )
 
         # 3. generate sequences
+        # Capture trunc_len before generate() — it mutates sampling_params["max_tokens"]
+        # in-place (sets it to remaining = original - generated). All n rollout tasks
+        # share the same sampling_params dict, so any task that reads after the first
+        # generate() completes would see a stale (possibly 0) value.
+        trunc_len = min(sampling_params.get("max_tokens", self.response_length), self.response_length)
+
         metrics = {}
         with simple_timer("generate_sequences", metrics):
             output: TokenOutput = await self.server_manager.generate(
@@ -64,11 +70,11 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
-            response_ids=output.token_ids[: self.response_length],
-            response_mask=response_mask[: self.response_length],
-            response_logprobs=output.log_probs[: self.response_length] if output.log_probs else None,
+            response_ids=output.token_ids[:trunc_len],
+            response_mask=response_mask[:trunc_len],
+            response_logprobs=output.log_probs[:trunc_len] if output.log_probs else None,
             routed_experts=(
-                output.routed_experts[: len(prompt_ids) + self.response_length]
+                output.routed_experts[: len(prompt_ids) + trunc_len]
                 if output.routed_experts is not None
                 else None
             ),
