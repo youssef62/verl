@@ -397,9 +397,10 @@ class vLLMHttpServer:
             lora_rank = 0
 
         if lora_rank > 0:
+            max_loras = self.model_config.lora.get("max_loras", 1)
             lora_args = {
                 "enable_lora": True,
-                "max_loras": 1,
+                "max_loras": max_loras,
                 "max_lora_rank": get_vllm_max_lora_rank(lora_rank),
             }
             if self.model_config.lora.get("fully_sharded_loras", False):
@@ -547,6 +548,8 @@ class vLLMHttpServer:
         )
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        # Pop _lora_int_id before constructing SamplingParams (it's not a valid SamplingParams field)
+        request_lora_int_id = sampling_params.pop("_lora_int_id", None)
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
@@ -557,10 +560,19 @@ class vLLMHttpServer:
 
         prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
 
-        # Add lora request
+        # Add lora request — support per-request lora_int_id for multi-tenant
         lora_request = None
-        if self.lora_as_adapter:
-            # Make sure we also check that the lora is already loaded in the engine
+        if request_lora_int_id is not None:
+            # Multi-tenant: use the per-request lora_int_id
+            loaded_loras = await self.engine.list_loras()
+            if request_lora_int_id in loaded_loras:
+                lora_request = LoRARequest(
+                    lora_name=str(request_lora_int_id),
+                    lora_int_id=request_lora_int_id,
+                    lora_path=VLLM_LORA_PATH,  # dummy path — weights loaded via TensorLoRARequest
+                )
+        elif self.lora_as_adapter:
+            # Single-tenant fallback: use the default hardcoded lora
             lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
             if lora_loaded:
                 lora_request = LoRARequest(
@@ -612,6 +624,50 @@ class vLLMHttpServer:
             num_preempted=num_preempted,
             extra_fields={"global_steps": self.global_steps},
         )
+
+    async def add_tenant_lora(self, lora_int_id: int, peft_config: dict, lora_tensors: dict):
+        """Add or update a tenant's LoRA adapter in the vLLM engine.
+
+        Used by multi-tenant training to sync per-tenant adapters to the rollout engine.
+
+        Loads the LoRA directly on each worker via collective_rpc("update_tenant_lora"),
+        mirroring the working single-tenant _update_weights path. The worker creates a
+        TensorLoRARequest locally and calls self.add_lora(), so the hijacked _load_adapter
+        sees proper tensor data without going through EngineCore serialization.
+
+        On the first call, also registers the LoRA with engine.add_lora() for engine-level
+        tracking (so vLLM accepts generation requests referencing this LoRA ID).
+        """
+        if self.node_rank != 0:
+            return
+
+        import cloudpickle
+
+        lora_tensors_bytes = cloudpickle.dumps(lora_tensors)
+
+        # Load/update LoRA directly on workers — avoids the race condition where
+        # engine.remove_lora() + engine.add_lora() left a window for in-flight
+        # generation requests to hit a removed LoRA.
+        update_ret = self.engine.collective_rpc(
+            "update_tenant_lora", args=(lora_int_id, peft_config, lora_tensors_bytes)
+        )
+        if inspect.isawaitable(update_ret):
+            await update_ret
+
+        # Register with engine for engine-level tracking on first call only.
+        # On subsequent updates, the engine already knows about this lora_int_id.
+        loaded_loras = await self.engine.list_loras()
+        if lora_int_id not in loaded_loras:
+            lora_request = LoRARequest(
+                lora_name=str(lora_int_id),
+                lora_int_id=lora_int_id,
+                lora_path=VLLM_LORA_PATH,
+            )
+            add_ret = self.engine.add_lora(lora_request)
+            if inspect.isawaitable(add_ret):
+                await add_ret
+
+        logger.info(f"[vLLMHttpServer] Added tenant LoRA adapter lora_int_id={lora_int_id}")
 
     async def wake_up(self):
         if self.node_rank != 0:

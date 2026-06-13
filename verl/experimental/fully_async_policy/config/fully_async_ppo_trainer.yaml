@@ -28,6 +28,10 @@ async_training:
   # whether to use trainer do_validate
   use_trainer_do_validate: False
 
+  # Max in-flight generations per vLLM server handle. Controls backpressure.
+  # In multi-tenant mode the effective limit is this value * num_tenants.
+  max_concurrent_samples_per_replica: 16
+
 # Rollout config
 rollout:
 

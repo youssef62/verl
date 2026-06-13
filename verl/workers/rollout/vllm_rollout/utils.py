@@ -152,8 +152,18 @@ class vLLMColocateWorkerExtension:
         # patch weight loader to support MoE model
         patch_vllm_moe_model_weight_loader(self.model_runner.model)
 
-    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
-        """Update the weights of the rollout model."""
+    def update_weights_from_ipc(
+        self,
+        peft_config: dict = None,
+        base_sync_done=False,
+        use_shm: bool = False,
+        lora_int_id: int = None,
+    ):
+        """Update the weights of the rollout model.
+
+        ``lora_int_id`` overrides the default ``VLLM_LORA_INT_ID`` slot — used by
+        multi-tenant sync to land each tenant's adapter in its own slot.
+        """
         from vllm.platforms import current_platform
 
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
@@ -161,9 +171,11 @@ class vLLMColocateWorkerExtension:
         if current_platform.device_type == "npu" and self.device is None:
             self.device = torch.device(f"npu:{self.local_rank}")
 
+        target_lora_int_id = lora_int_id if lora_int_id is not None else VLLM_LORA_INT_ID
+
         # In async mode, make sure the old lora is removed before adding the new one
         if peft_config and base_sync_done:
-            self.remove_lora(VLLM_LORA_INT_ID)
+            self.remove_lora(target_lora_int_id)
 
         use_standard_weight_load = not (peft_config and base_sync_done) and not is_fp8_model(
             self.model_runner.vllm_config
@@ -187,7 +199,10 @@ class vLLMColocateWorkerExtension:
         )
         receiver.receive_weights(
             on_bucket_received=lambda weights: self._update_weights(
-                weights, peft_config=peft_config, base_sync_done=base_sync_done
+                weights,
+                peft_config=peft_config,
+                base_sync_done=base_sync_done,
+                lora_int_id=target_lora_int_id,
             )
         )
 
@@ -205,18 +220,24 @@ class vLLMColocateWorkerExtension:
             model_config = self.model_runner.vllm_config.model_config
             process_weights_after_loading(model, model_config, self.device)
 
-    def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
+    def _update_weights(
+        self,
+        weights: list[tuple[str, torch.Tensor]],
+        peft_config: dict,
+        base_sync_done: bool,
+        lora_int_id: int = VLLM_LORA_INT_ID,
+    ):
         if peft_config and base_sync_done:
             weights = dict(weights)
             lora_request = TensorLoRARequest(
-                lora_name=VLLM_LORA_NAME,
-                lora_int_id=VLLM_LORA_INT_ID,
+                lora_name=str(lora_int_id),
+                lora_int_id=lora_int_id,
                 lora_path=VLLM_LORA_PATH,
                 peft_config=peft_config,
                 lora_tensors=weights,
             )
             self.add_lora(lora_request)
-            logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
+            logger.info(f"vLLM load weights, loaded_params: {len(weights)} into lora_int_id={lora_int_id}")
         else:
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
@@ -228,6 +249,33 @@ class vLLMColocateWorkerExtension:
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
                 self.model_runner.model.load_weights(weights)
+
+    def update_tenant_lora(self, lora_int_id: int, peft_config: dict, lora_tensors_bytes: bytes):
+        """Load or update a tenant's LoRA adapter directly on this worker.
+
+        Called via collective_rpc from add_tenant_lora(). This mirrors the working
+        single-tenant _update_weights path: creates a TensorLoRARequest locally on
+        the worker and calls self.add_lora(), so the hijacked _load_adapter sees a
+        proper TensorLoRARequest with peft_config and lora_tensors.
+
+        This avoids the race condition in the old approach (engine.remove_lora +
+        engine.add_lora through EngineCore) where in-flight generation requests
+        could hit a removed LoRA before the new one was registered.
+        """
+        import cloudpickle
+
+        lora_tensors = cloudpickle.loads(lora_tensors_bytes)
+        lora_request = TensorLoRARequest(
+            lora_name=str(lora_int_id),
+            lora_int_id=lora_int_id,
+            lora_path=VLLM_LORA_PATH,
+            peft_config=peft_config,
+            lora_tensors=lora_tensors,
+        )
+        # Remove old LoRA from worker cache before adding updated one
+        self.remove_lora(lora_int_id)
+        self.add_lora(lora_request)
+        logger.info(f"[vLLMColocateWorker] Updated tenant LoRA lora_int_id={lora_int_id}")
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication."""
