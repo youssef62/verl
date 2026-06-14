@@ -23,13 +23,13 @@ import numpy as np
 import ray
 import torch
 
-from verl.experimental.fully_async_policy.detach_utils import (
+from verl.experimental.multi_tenant.detach_utils import (
     RolloutSample,
     ValidateMetrics,
     prepare_single_generation_data,
     safe_create_task,
 )
-from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
+from verl.experimental.multi_tenant.message_queue import MessageQueueClient
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayWorkerGroup
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
@@ -39,8 +39,7 @@ from verl.utils.profiler import marked_timer
 from verl.utils.tracking import ValidationGenerationsLogger
 
 
-@ray.remote(num_cpus=10, max_concurrency=100)
-class FullyAsyncRollouter(SeparateRayPPOTrainer):
+class DecoupledRollouterBase(SeparateRayPPOTrainer):
     """
     Asynchronous sample generator, responsible for continuously generating training samples
     and putting them into MessageQueue
@@ -93,7 +92,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         # ==================== fully async config ====================
 
-        print("[FullyAsyncRollouter] Creating datasets...")
+        print("[DecoupledRollouter] Creating datasets...")
         from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
         from verl.utils.dataset.rl_dataset import collate_fn
 
@@ -118,21 +117,21 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             rollout_gpus = config.rollout.nnodes * config.rollout.n_gpus_per_node
             train_gpus = config.trainer.nnodes * config.trainer.n_gpus_per_node
             total_gpus = rollout_gpus + train_gpus
-            print(f"[FullyAsyncRollouter] split before val_dataset total len: {len(val_dataset)}")
+            print(f"[DecoupledRollouter] split before val_dataset total len: {len(val_dataset)}")
             split_dataset = val_dataset.split(total_gpus)
             rollout_val_dataset0 = split_dataset[:rollout_gpus]
             from torch.utils.data import ConcatDataset
 
             val_dataset = ConcatDataset(rollout_val_dataset0)
-            print(f"[FullyAsyncRollouter] split after val_dataset total len: {len(val_dataset)}")
-        print(f"[FullyAsyncRollouter] Rollouter _create_dataloader...\n{train_dataset}\n{val_dataset}")
+            print(f"[DecoupledRollouter] split after val_dataset total len: {len(val_dataset)}")
+        print(f"[DecoupledRollouter] Rollouter _create_dataloader...\n{train_dataset}\n{val_dataset}")
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.total_rollout_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
         if self.config.rollout.total_rollout_steps is not None:
             self.total_rollout_steps = min(self.config.rollout.total_rollout_steps, self.total_rollout_steps)
-        print(f"[FullyAsyncRollouter] Total rollout steps: {self.total_rollout_steps}")
+        print(f"[DecoupledRollouter] Total rollout steps: {self.total_rollout_steps}")
         self.total_train_steps = None
 
         # Rollouter parameter configuration
@@ -207,12 +206,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
             )
 
-            self.max_concurrent_samples = len(self.async_rollout_manager.server_handles) * 16
+            per_replica = self.config.async_training.get("max_concurrent_samples_per_replica", 16)
+            self.max_concurrent_samples = len(self.async_rollout_manager.server_handles) * per_replica
             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
             self.max_queue_size = self.max_required_samples
 
             print(
-                f"[FullyAsyncRollouter] required_samples : {self.required_samples} "
+                f"[DecoupledRollouter] required_samples : {self.required_samples} "
                 f"max_required_samples: {self.max_required_samples} "
                 f"max_queue_size: {self.max_queue_size} "
                 f"total_train_steps: {self.total_train_steps} "
@@ -227,6 +227,16 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     def get_replicas(self):
         """Get rollout worker group"""
         return self.async_rollout_manager.rollout_replicas
+
+    def get_server_addresses(self) -> list[str] | None:
+        """Return vLLM HTTP server addresses (host:port) for all replicas.
+
+        Returns None if the async rollout manager has not been initialised yet
+        (i.e. the rollouter's fit() has not reached _init_async_rollout_manager).
+        """
+        if self.async_rollout_manager is None:
+            return None
+        return list(self.async_rollout_manager.server_addresses)
 
     def get_max_queue_size(self):
         return self.max_queue_size
@@ -248,14 +258,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             rollout_active_time = self.idle_start_time - self.step_start_time
             rollout_version_time = time.time() - self.step_start_time
             idle_ratio = 1 - rollout_active_time / rollout_version_time
-            timing_raw["fully_async/rollouter/active_time"] = rollout_active_time
-            timing_raw["fully_async/rollouter/version_time"] = rollout_version_time
-            timing_raw["fully_async/rollouter/idle_ratio"] = idle_ratio
+            timing_raw["decoupled/rollouter/active_time"] = rollout_active_time
+            timing_raw["decoupled/rollouter/version_time"] = rollout_version_time
+            timing_raw["decoupled/rollouter/idle_ratio"] = idle_ratio
 
             print(
-                f"[FullyAsyncRollouter][Public][reset_staleness] "
+                f"[DecoupledRollouter][Public][reset_staleness] "
                 f"reset staleness_samples to: {self.staleness_samples} "
-                f"idle_ratio: {timing_raw['fully_async/rollouter/idle_ratio']:.4f}"
+                f"idle_ratio: {timing_raw['decoupled/rollouter/idle_ratio']:.4f}"
             )
             self.step_start_time = time.time()
         return timing_raw
@@ -281,18 +291,18 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         async with self.dataloader_lock:
             dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
-        print(f"[FullyAsyncRollouter] Saved dataloader checkpoint to {dataloader_local_path}")
+        print(f"[DecoupledRollouter] Saved dataloader checkpoint to {dataloader_local_path}")
 
     def load_checkpoint(self):
         """Load checkpoint including dataloader state based on resume mode"""
 
         if self.config.trainer.resume_mode == "disable":
-            print("[FullyAsyncRollouter] Resume mode is disabled, starting from scratch")
+            print("[DecoupledRollouter] Resume mode is disabled, starting from scratch")
             return 0
 
         # Determine checkpoint folder path
         if self.config.trainer.default_hdfs_dir is not None:
-            raise NotImplementedError("[FullyAsyncRollouter] Load from hdfs is not implemented yet")
+            raise NotImplementedError("[DecoupledRollouter] Load from hdfs is not implemented yet")
         else:
             checkpoint_folder = self.config.trainer.default_local_dir
             if not os.path.isabs(checkpoint_folder):
@@ -304,47 +314,47 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Find and validate global_step_folder based on resume mode
         if self.config.trainer.resume_mode == "auto":
             if global_step_folder is None:
-                print("[FullyAsyncRollouter] Training from scratch (no checkpoint found)")
+                print("[DecoupledRollouter] Training from scratch (no checkpoint found)")
                 return 0
         elif self.config.trainer.resume_mode == "resume_path":
             assert isinstance(self.config.trainer.resume_from_path, str), (
-                "[FullyAsyncRollouter] resume_from_path must be str type"
+                "[DecoupledRollouter] resume_from_path must be str type"
             )
             assert "global_step_" in self.config.trainer.resume_from_path, (
-                "[FullyAsyncRollouter] resume_from_path must specify the global_steps"
+                "[DecoupledRollouter] resume_from_path must specify the global_steps"
             )
             global_step_folder = self.config.trainer.resume_from_path
             if not os.path.isabs(global_step_folder):
                 working_dir = os.getcwd()
                 global_step_folder = os.path.join(working_dir, global_step_folder)
         else:
-            raise ValueError(f"[FullyAsyncRollouter] Unknown resume_mode: {self.config.trainer.resume_mode}")
+            raise ValueError(f"[DecoupledRollouter] Unknown resume_mode: {self.config.trainer.resume_mode}")
 
-        print(f"[FullyAsyncRollouter] Loading checkpoint from: {global_step_folder}")
+        print(f"[DecoupledRollouter] Loading checkpoint from: {global_step_folder}")
 
         # Extract and set global step
         trainer_global_steps = int(global_step_folder.split("global_step_")[-1])
         self.global_steps = (
             trainer_global_steps * self.required_samples * self.config.async_training.trigger_parameter_sync_step + 1
         )
-        print(f"[FullyAsyncRollouter] Setting global_steps to {self.global_steps}")
+        print(f"[DecoupledRollouter] Setting global_steps to {self.global_steps}")
 
         # Load dataloader state
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             self.train_dataloader.load_state_dict(dataloader_state_dict)
-            print(f"[FullyAsyncRollouter] Loaded dataloader state from {dataloader_local_path}")
+            print(f"[DecoupledRollouter] Loaded dataloader state from {dataloader_local_path}")
         else:
             print(
-                f"[FullyAsyncRollouter] Warning: No dataloader state found at {dataloader_local_path}, "
+                f"[DecoupledRollouter] Warning: No dataloader state found at {dataloader_local_path}, "
                 f"will start from scratch"
             )
 
     def _validate_config(self):
         # Validate asynchronous training configuration
         if not hasattr(self.config, "async_training"):
-            raise ValueError("[FullyAsyncRollouter] Missing async_training configuration")
+            raise ValueError("[DecoupledRollouter] Missing async_training configuration")
         assert self.config.actor_rollout_ref.rollout.calculate_log_probs, "must rollout calculate log_probs"
 
     async def init_workers(self):
@@ -389,10 +399,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         # create async rollout manager and request scheduler
         assert self.config.actor_rollout_ref.rollout.mode == "async"
-        from verl.experimental.fully_async_policy.agent_loop import FullyAsyncAgentLoopManager
+        from verl.experimental.multi_tenant.agent_loop import DecoupledAgentLoopManager
 
         self.async_rollout_mode = True
-        self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
+        self.async_rollout_manager = await DecoupledAgentLoopManager.create(
             config=self.config, worker_group=self.rollout_wg, reward_loop_worker_handles=reward_loop_worker_handles
         )
 
@@ -418,7 +428,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             # Check if have reached the last step
             if self.global_steps >= self.total_rollout_steps:
                 print(
-                    f"[FullyAsyncRollouter][Feed] "
+                    f"[DecoupledRollouter][Feed] "
                     f"Maximum count has been reached, stop adding new samples: "
                     f"{self.global_steps} >= {self.total_rollout_steps}"
                 )
@@ -428,7 +438,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         # End signal
         await self.pending_queue.put(None)
-        print(f"[FullyAsyncRollouter][Feed] Sample addition is complete, {self.global_steps} samples have been added")
+        print(f"[DecoupledRollouter][Feed] Sample addition is complete, {self.global_steps} samples have been added")
 
     async def _processor_worker(self):
         """
@@ -436,9 +446,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """
         while True:
             if self.paused or await self._should_pause_generation():
-                print(
-                    "[FullyAsyncRollouter][Processor] Received pause signal, waiting for remaining tasks to return..."
-                )
+                print("[DecoupledRollouter][Processor] Received pause signal, waiting for remaining tasks to return...")
                 async with self.lock:
                     self.paused = True
                 while self.active_tasks:
@@ -462,9 +470,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.staleness_samples += 1
 
             if rollout_sample is None:
-                print(
-                    "[FullyAsyncRollouter][Processor] Received end signal, waiting for remaining tasks to complete..."
-                )
+                print("[DecoupledRollouter][Processor] Received end signal, waiting for remaining tasks to complete...")
                 while self.active_tasks:
                     async with self.lock:
                         if self.active_tasks:
@@ -523,7 +529,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             await self._init_async_rollout_manager()
 
         # Start the streaming loop
-        print(f"[FullyAsyncRollouter] Start streaming mode, maximum concurrent samples: {self.max_concurrent_samples}")
+        print(f"[DecoupledRollouter] Start streaming mode, maximum concurrent samples: {self.max_concurrent_samples}")
 
         # Start sample feed coroutine, streaming process coroutine
         self.feed_task = safe_create_task(self._feed_samples(), name="feed_task")
@@ -544,17 +550,17 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             if self.feed_task not in done:
                 raise RuntimeError("Processor task exited prematurely")
 
-            print("[FullyAsyncRollouter] Sample feed completed")
+            print("[DecoupledRollouter] Sample feed completed")
 
             # Wait for streaming to complete
             await self.processor_task
-            print("[FullyAsyncRollouter] Streaming process completed")
+            print("[DecoupledRollouter] Streaming process completed")
 
             await self.pending_queue.join()
-            print("[FullyAsyncRollouter] pending_queue joined")
+            print("[DecoupledRollouter] pending_queue joined")
 
         except Exception as e:
-            print(f"[FullyAsyncRollouter] Streaming process exception: {e}")
+            print(f"[DecoupledRollouter] Streaming process exception: {e}")
             raise e
 
         finally:
@@ -581,7 +587,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         Main async fit method that coordinates all coroutines
         """
 
-        print("[FullyAsyncRollouter] Starting FullyAsyncRollouter...")
+        print("[DecoupledRollouter] Starting DecoupledRollouter...")
 
         if self.message_queue_client is None:
             raise ValueError("MessageQueue client not set. Call set_message_queue_client() first.")
@@ -599,7 +605,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             # Run build and monitoring tasks concurrently
             await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
         except Exception as e:
-            print(f"[FullyAsyncRollouter] Asynchronous task execution error: {e}")
+            print(f"[DecoupledRollouter] Asynchronous task execution error: {e}")
         finally:
             if not generation_task.done():
                 generation_task.cancel()
@@ -609,7 +615,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             # Wait for the task to complete
             await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
 
-        print("[FullyAsyncRollouter] Rollouter fit completed")
+        print("[DecoupledRollouter] Rollouter fit completed")
 
     async def _async_monitor_loop(self):
         """
@@ -630,14 +636,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             current_time = time.time()
             if current_time - last_stats_time >= stats_interval:
                 stats = await self.get_statistics()
-                print(f"[FullyAsyncRollouter][MonitorLoop][Statistics] {pformat(stats)}")
+                print(f"[DecoupledRollouter][MonitorLoop][Statistics] {pformat(stats)}")
                 last_stats_time = current_time
 
             # Trigger rollout recovery
             if self.paused and not await self._should_pause_generation():
                 async with self.lock:
                     self.paused = False
-                    print("[FullyAsyncRollouter][ShouldPause] notify all wait tasks.")
+                    print("[DecoupledRollouter][ShouldPause] notify all wait tasks.")
                     self.condition.notify_all()
 
     async def _should_pause_generation(self) -> bool:
@@ -648,7 +654,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         if queue_size >= self.max_queue_size:
             if not self.paused:
                 print(
-                    f"[FullyAsyncRollouter][ShouldPause]  "
+                    f"[DecoupledRollouter][ShouldPause]  "
                     f"due to full queue: size={queue_size}, max={self.max_queue_size}"
                 )
             return True
@@ -656,7 +662,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         if self.staleness_samples >= self.max_required_samples:
             if not self.paused:
                 print(
-                    "[FullyAsyncRollouter][ShouldPause] "
+                    "[DecoupledRollouter][ShouldPause] "
                     f"due to "
                     f"staleness_samples {self.staleness_samples} >= max_required_samples {self.max_required_samples} "
                 )

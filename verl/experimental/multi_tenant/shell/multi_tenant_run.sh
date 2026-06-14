@@ -94,7 +94,7 @@ cd "/users/${USER}/scratch/verl"
 
 
 # Keep literal quotes for Hydra so commas are treated as part of one string value.
-PYTHONUNBUFFERED=1 python -m verl.experimental.fully_async_policy.multi_tenant_main \
+PYTHONUNBUFFERED=1 python -m verl.experimental.multi_tenant.multi_tenant_main \
     +multi_tenant.tenants="'${TENANTS}'" \
     +multi_tenant.scheduling=${scheduling} \
     data.prompt_key=prompt \

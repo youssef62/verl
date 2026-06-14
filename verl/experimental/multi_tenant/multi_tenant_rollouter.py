@@ -1,4 +1,4 @@
-"""Multi-tenant rollouter that extends FullyAsyncRollouter.
+"""Multi-tenant rollouter that extends DecoupledRollouterBase.
 
 Creates per-tenant dataloaders, interleaves samples across tenants,
 and routes generated samples to per-tenant MessageQueues.
@@ -6,19 +6,18 @@ and routes generated samples to per-tenant MessageQueues.
 
 import asyncio
 import time
-from pprint import pformat
 
 import numpy as np
 import ray
 
-from verl.experimental.fully_async_policy.detach_utils import (
+from verl.experimental.multi_tenant.base_rollouter import DecoupledRollouterBase
+from verl.experimental.multi_tenant.detach_utils import (
     RolloutSample,
     TenantConfig,
     prepare_single_generation_data,
     safe_create_task,
 )
-from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRolllouterBase
-from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
+from verl.experimental.multi_tenant.message_queue import MessageQueueClient
 from verl.single_controller.ray import RayWorkerGroup
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role, WorkerType
@@ -26,7 +25,7 @@ from verl.utils.profiler import marked_timer
 
 
 @ray.remote(num_cpus=10, max_concurrency=100)
-class MultiTenantRollouter(FullyAsyncRolllouterBase):
+class MultiTenantRollouter(DecoupledRollouterBase):
     """Multi-tenant rollouter: per-tenant data loading, generation with tenant LoRA, per-tenant queues."""
 
     def __init__(
@@ -71,7 +70,10 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
         self.tenant_queue_clients: dict[str, MessageQueueClient] = {}
 
         # Scheduling strategy: "round_robin" (interleave tenants) or "burst" (fill one tenant at a time)
-        self.scheduling = getattr(config, "multi_tenant", {}).get("scheduling", "round_robin") if hasattr(config, "multi_tenant") else "round_robin"
+        if hasattr(config, "multi_tenant"):
+            self.scheduling = getattr(config, "multi_tenant", {}).get("scheduling", "round_robin")
+        else:
+            self.scheduling = "round_robin"
         if self.scheduling not in ("round_robin", "burst"):
             raise ValueError(f"Unknown scheduling strategy: {self.scheduling!r}, expected 'round_robin' or 'burst'")
         print(f"[MTRollouter] Scheduling strategy: {self.scheduling}")
@@ -112,6 +114,7 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
             tenant_data_config = config.data.copy() if hasattr(config.data, "copy") else config.data
             if base_seed is not None:
                 from omegaconf import OmegaConf
+
                 tenant_data_config = OmegaConf.to_container(config.data, resolve=True)
                 tenant_data_config["seed"] = base_seed + tenant_idx
                 tenant_data_config = OmegaConf.create(tenant_data_config)
@@ -180,7 +183,9 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
             )
 
             per_replica = self.config.async_training.get("max_concurrent_samples_per_replica", 16)
-            self.max_concurrent_samples = len(self.async_rollout_manager.server_handles) * per_replica * len(self.tenant_configs)
+            self.max_concurrent_samples = (
+                len(self.async_rollout_manager.server_handles) * per_replica * len(self.tenant_configs)
+            )
             self.max_queue_size = self.max_required_samples
 
             print(
@@ -210,8 +215,10 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
 
     def _is_tenant_gated(self, tc: TenantConfig) -> bool:
         """Check if a tenant is blocked by staleness or queue-full gates."""
-        if (self.max_required_samples is not None
-                and self.tenant_staleness_samples.get(tc.name, 0) >= self.max_required_samples):
+        if (
+            self.max_required_samples is not None
+            and self.tenant_staleness_samples.get(tc.name, 0) >= self.max_required_samples
+        ):
             return True
         if self.max_queue_size is not None and self.tenant_queue_clients:
             queue_size = self.tenant_queue_clients[tc.name].get_statistics_sync()["queue_size"]
@@ -422,16 +429,14 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
-            data_source_lst.append(
-                test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
-            )
+            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
         data_sources = np.concatenate(data_source_lst, axis=0)
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
     def do_validate(self):
         """Override: run per-tenant validation with each tenant's val dataset and LoRA adapter."""
-        from verl.experimental.fully_async_policy.detach_utils import ValidateMetrics
+        from verl.experimental.multi_tenant.detach_utils import ValidateMetrics
 
         timing_raw = {}
         all_metrics = {}
@@ -549,8 +554,7 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
         if all_full:
             if not self.paused:
                 print(
-                    f"[MTRollouter][ShouldPause] All tenant queues full "
-                    f"(max={self.max_queue_size}), pausing processor"
+                    f"[MTRollouter][ShouldPause] All tenant queues full (max={self.max_queue_size}), pausing processor"
                 )
             return True
 
@@ -567,7 +571,6 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
         The condition is notified so any _feed_samples coroutine waiting on this tenant
         wakes up and re-evaluates whether it can proceed.
         """
-        import time
 
         async with self.lock:
             self.paused = False
@@ -600,19 +603,18 @@ class MultiTenantRollouter(FullyAsyncRolllouterBase):
             else:
                 rollout_active_time = rollout_version_time
             idle_ratio = 1 - rollout_active_time / rollout_version_time if rollout_version_time > 0 else 0.0
-            timing_raw["fully_async/rollouter/active_time"] = rollout_active_time
-            timing_raw["fully_async/rollouter/version_time"] = rollout_version_time
-            timing_raw["fully_async/rollouter/idle_ratio"] = idle_ratio
+            timing_raw["decoupled/rollouter/active_time"] = rollout_active_time
+            timing_raw["decoupled/rollouter/version_time"] = rollout_version_time
+            timing_raw["decoupled/rollouter/idle_ratio"] = idle_ratio
 
             print(
                 f"[MTRollouter][Public][reset_staleness] tenant_id={tenant_id!r} "
                 f"reset staleness_samples to: {self.staleness_samples} "
                 f"tenant_staleness={dict(self.tenant_staleness_samples)} "
-                f"idle_ratio: {timing_raw['fully_async/rollouter/idle_ratio']:.4f}"
+                f"idle_ratio: {timing_raw['decoupled/rollouter/idle_ratio']:.4f}"
             )
             self.step_start_time = time.time()
         return timing_raw
-
 
     async def get_statistics(self) -> dict:
         """Override: include per-tenant queue stats."""

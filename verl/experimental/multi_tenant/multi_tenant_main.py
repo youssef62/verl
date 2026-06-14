@@ -1,6 +1,6 @@
-"""Multi-tenant fully async training entry point.
+"""Multi-tenant decoupled training entry point.
 
-Extends the fully_async_main orchestrator to support multiple tenants,
+Orchestrates the decoupled trainer/rollouter to support multiple tenants,
 each training their own LoRA adapter on a shared base model.
 """
 
@@ -14,10 +14,10 @@ import hydra
 import ray
 from omegaconf import OmegaConf
 
-from verl.experimental.fully_async_policy.detach_utils import TenantConfig, parse_tenants
-from verl.experimental.fully_async_policy.message_queue import MessageQueue, MessageQueueClient
-from verl.experimental.fully_async_policy.multi_tenant_rollouter import MultiTenantRollouter
-from verl.experimental.fully_async_policy.multi_tenant_trainer import MultiTenantTrainer
+from verl.experimental.multi_tenant.detach_utils import parse_tenants
+from verl.experimental.multi_tenant.message_queue import MessageQueue, MessageQueueClient
+from verl.experimental.multi_tenant.multi_tenant_rollouter import MultiTenantRollouter
+from verl.experimental.multi_tenant.multi_tenant_trainer import MultiTenantTrainer
 from verl.experimental.separation.utils import create_resource_pool_manager, create_role_worker_mapping
 from verl.trainer.ppo.utils import Role
 from verl.utils.fs import copy_to_local
@@ -46,6 +46,7 @@ class MultiTenantTaskRunner:
         config_path = config.multi_tenant.get("config_path")
         if config_path:
             import yaml
+
             with open(config_path) as f:
                 tenants_cfg = yaml.safe_load(f)["tenants"]
         else:
@@ -206,7 +207,7 @@ class MultiTenantTaskRunner:
             print("[MT MAIN] Training completed or interrupted")
 
 
-@hydra.main(config_path="config", config_name="fully_async_ppo_trainer", version_base=None)
+@hydra.main(config_path="config", config_name="multi_tenant_ppo_trainer", version_base=None)
 def main(config):
     from verl.trainer.main_ppo import run_ppo
 
@@ -218,9 +219,7 @@ def main(config):
     if not hasattr(config, "multi_tenant") or (
         not config.multi_tenant.get("tenants") and not config.multi_tenant.get("config_path")
     ):
-        raise RuntimeError(
-            "must set multi_tenant.tenants or multi_tenant.config_path config"
-        )
+        raise RuntimeError("must set multi_tenant.tenants or multi_tenant.config_path config")
 
     from time import time
 

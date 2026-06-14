@@ -25,12 +25,12 @@ from tqdm import tqdm
 
 from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
-from verl.experimental.fully_async_policy.detach_utils import (
+from verl.experimental.multi_tenant.detach_utils import (
     MetricsAggregator,
     ValidateMetrics,
     assemble_batch_from_rollout_samples,
 )
-from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
+from verl.experimental.multi_tenant.message_queue import MessageQueueClient
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
@@ -50,8 +50,7 @@ class TrainingStopException(Exception):
     pass
 
 
-@ray.remote(num_cpus=10)
-class FullyAsyncTrainer(SeparateRayPPOTrainer):
+class DecoupledTrainerBase(SeparateRayPPOTrainer):
     """
     A fully asynchronous PPO trainer that obtains samples from a MessageQueue for training.
     Based on an improved implementation of OneStepOffRayTrainer
@@ -156,13 +155,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
             val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
             rollout_gpus = config.rollout.nnodes * config.rollout.n_gpus_per_node
-            print(f"[FullyAsyncTrainer] split before val_dataset total len: {len(val_dataset)}")
+            print(f"[DecoupledTrainer] split before val_dataset total len: {len(val_dataset)}")
             split_dataset = val_dataset.split(total_gpus)
             rollout_val_dataset0 = split_dataset[rollout_gpus:]
             from torch.utils.data import ConcatDataset
 
             val_dataset = ConcatDataset(rollout_val_dataset0)
-            print(f"[FullyAsyncTrainer] split after val_dataset total len: {len(val_dataset)}")
+            print(f"[DecoupledTrainer] split after val_dataset total len: {len(val_dataset)}")
             self.val_dataset = val_dataset
             # update val_dataloader
             val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
@@ -170,7 +169,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 val_batch_size = len(val_dataset)
             from torchdata.stateful_dataloader import StatefulDataLoader
 
-            print(f"[FullyAsyncTrainer] create val_dataloader with batch_size: {val_batch_size}")
+            print(f"[DecoupledTrainer] create val_dataloader with batch_size: {val_batch_size}")
             self.val_dataloader = StatefulDataLoader(
                 dataset=val_dataset,
                 batch_size=val_batch_size,
@@ -193,7 +192,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.checkpoint_manager = CheckpointEngineManager(
             config=checkpoint_engine_config, trainer=self.actor_wg, replicas=replicas
         )
-        print("[FullyAsyncTrainer] Checkpoint manager initialized")
+        print("[DecoupledTrainer] Checkpoint manager initialized")
 
     def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""
@@ -233,7 +232,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             tuple: (epoch, batch_dict, gen_batch_output)
         """
         print(
-            f"[FullyAsyncTrainer] Requesting {self.required_samples} samples from queue",
+            f"[DecoupledTrainer] Requesting {self.required_samples} samples from queue",
             flush=True,
         )
 
@@ -247,7 +246,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
             if sample is None:
                 print(
-                    f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
+                    f"[DecoupledTrainer] Detected termination signal (None), stopping sample collection. "
                     f"Collected {len(queue_samples)}/{self.required_samples} samples"
                 )
                 break
@@ -256,19 +255,19 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
             if len(queue_samples) % 64 == 0:
                 print(
-                    f"[FullyAsyncTrainer] Collected {len(queue_samples)}/{self.required_samples} samples. "
+                    f"[DecoupledTrainer] Collected {len(queue_samples)}/{self.required_samples} samples. "
                     f"mq_len: {queue_len}"
                 )
 
         consumer_end = time.time()
 
         if not queue_samples or len(queue_samples) < self.required_samples:
-            print("[FullyAsyncTrainer] not enough samples collected after loop")
+            print("[DecoupledTrainer] not enough samples collected after loop")
             return None, None
         total_wait_time = consumer_end - consumer_start
 
         print(
-            f"[FullyAsyncTrainer] Loop collection completed: {len(queue_samples)}/{self.required_samples} samples, "
+            f"[DecoupledTrainer] Loop collection completed: {len(queue_samples)}/{self.required_samples} samples, "
             f"total wait time: {total_wait_time:.2f} seconds. "
             f"mq_len: {queue_len}"
         )
@@ -280,7 +279,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         else:
             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
 
-        batch.meta_info["fully_async/total_wait_time"] = total_wait_time
+        batch.meta_info["decoupled/total_wait_time"] = total_wait_time
         return 0, batch
 
     def _create_actor_rollout_classes(self):
@@ -326,14 +325,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
     def _init_reward_loop(self):
         if self.config.async_training.use_trainer_do_validate:
-            print("[FullyAsyncTrainer] Init reward loop")
+            print("[DecoupledTrainer] Init reward loop")
             super()._init_reward_loop()
 
     async def _init_async_rollout_manager(self):
         # use async rollout do validate
-        print(f"[FullyAsyncTrainer] use_trainer_do_validate: {self.config.async_training.use_trainer_do_validate}")
+        print(f"[DecoupledTrainer] use_trainer_do_validate: {self.config.async_training.use_trainer_do_validate}")
         if self.config.async_training.use_trainer_do_validate:
-            print("[FullyAsyncTrainer] Init async rollout manager")
+            print("[DecoupledTrainer] Init async rollout manager")
 
             # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
             # agent_reward_loop: streaming reward computation with actor rollout
@@ -357,7 +356,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 worker_group=self.actor_rollout_wg,
                 reward_loop_worker_handles=reward_loop_worker_handles,
             )
-            print("[FullyAsyncTrainer] async_rollout_manager initialized")
+            print("[DecoupledTrainer] async_rollout_manager initialized")
 
             # Modify checkpoint_engine config to use naive backend
             checkpoint_engine_cfg = self.config.actor_rollout_ref.rollout.checkpoint_engine
@@ -366,7 +365,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 checkpoint_engine_cfg.backend = "naive"
             checkpoint_engine_config = omega_conf_to_dataclass(checkpoint_engine_cfg)
 
-            print(f"[FullyAsyncTrainer] checkpoint_engine_config: {checkpoint_engine_config}")
+            print(f"[DecoupledTrainer] checkpoint_engine_config: {checkpoint_engine_config}")
 
             self.colocate_checkpoint_manager = CheckpointEngineManager(
                 config=checkpoint_engine_config,
@@ -381,10 +380,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             with open_dict(checkpoint_engine_cfg):
                 checkpoint_engine_cfg.backend = original_backend
 
-            print("[FullyAsyncTrainer] colocate_checkpoint_manager initialized")
+            print("[DecoupledTrainer] colocate_checkpoint_manager initialized")
 
         else:
-            print("[FullyAsyncTrainer] Skip async rollout manager (use_trainer_do_validate=False)")
+            print("[DecoupledTrainer] Skip async rollout manager (use_trainer_do_validate=False)")
 
     async def fit(self):
         """
@@ -393,7 +392,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
-        print("[FullyAsyncTrainer] Starting FullyAsyncTrainer...")
+        print("[DecoupledTrainer] Starting DecoupledTrainer...")
         if self.message_queue_client is None:
             raise ValueError("MessageQueue client not set. Call set_message_queue_client() first.")
         if self.rollouter is None:
@@ -409,7 +408,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             try:
                 await self.fit_step()
             except TrainingStopException:
-                print("[FullyAsyncTrainer] Training stopped by queue termination signal")
+                print("[DecoupledTrainer] Training stopped by queue termination signal")
                 break
 
         self.progress_bar.close()
@@ -495,7 +494,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
     def _fit_update_local_step(self):
         time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         print(
-            f"[FullyAsyncTrainer] global_steps: {self.global_steps} "
+            f"[DecoupledTrainer] global_steps: {self.global_steps} "
             f"local_trigger_step: {self.local_trigger_step} "
             f"trigger_parameter_sync_step: {self.trigger_parameter_sync_step} "
             f"{time_str}"
@@ -513,7 +512,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         with marked_timer("timing_s/param_sync", self.timing_raw):
             await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
         print(
-            f"[FullyAsyncTrainer] _fit_update_weights, "
+            f"[DecoupledTrainer] _fit_update_weights, "
             f"timing_s/param_sync: {self.timing_raw['timing_s/param_sync']:.4f} seconds "
             f"self.current_param_version: {self.current_param_version}"
         )
@@ -535,24 +534,24 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
     async def _validate_process(self):
         """Run trainer-side validation using async rollout manager"""
         if self.config.async_training.use_trainer_do_validate:
-            print("[FullyAsyncTrainer] _validate_process")
+            print("[DecoupledTrainer] _validate_process")
             from verl.utils.profiler import marked_timer
 
             # Wake up rollouter replicas and sync weights
-            print("[FullyAsyncTrainer] wake up replicas before validation")
+            print("[DecoupledTrainer] wake up replicas before validation")
             await self.colocate_checkpoint_manager.update_weights(global_steps=self.current_param_version)
 
             with marked_timer("trainer/validate_time", self.timing_raw):
                 train_val_metrics = self._validate(True)
 
             # Sleep rollouter replicas to free GPU memory for validation
-            print("[FullyAsyncTrainer] sleep replicas after validation")
+            print("[DecoupledTrainer] sleep replicas after validation")
             await self.colocate_checkpoint_manager.sleep_replicas()
 
-            print(f"[FullyAsyncTrainer] validate timing: {self.timing_raw['trainer/validate_time']}")
+            print(f"[DecoupledTrainer] validate timing: {self.timing_raw['trainer/validate_time']}")
             return train_val_metrics
         else:
-            print("[FullyAsyncTrainer] _validate_process without async_rollout_manager")
+            print("[DecoupledTrainer] _validate_process without async_rollout_manager")
             return None
 
     async def _fit_validate(self, val_before_train=False):
@@ -584,14 +583,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             if new_metrics:
                 self.logger.log(data=new_metrics, step=self.current_param_version)
                 pprint(
-                    f"[FullyAsyncTrainer] parameter version: {self.current_param_version} "
+                    f"[DecoupledTrainer] parameter version: {self.current_param_version} "
                     f"Validation metrics: {new_metrics}, timing: {self.timing_raw['timing_s/merge_val']}"
                 )
         else:
             if val_metrics.metrics:
                 self.logger.log(data=val_metrics.metrics, step=self.current_param_version)
                 pprint(
-                    f"[FullyAsyncTrainer] parameter version: {self.current_param_version} "
+                    f"[DecoupledTrainer] parameter version: {self.current_param_version} "
                     f"Validation metrics: {val_metrics.metrics}"
                 )
         self.logger.log(data=val_metrics.timing_raw, step=self.current_param_version)
@@ -645,7 +644,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.config.trainer.default_local_dir, f"global_step_{self.current_param_version}"
         )
 
-        print(f"[FullyAsyncTrainer] local_global_step_folder: {local_global_step_folder}")
+        print(f"[DecoupledTrainer] local_global_step_folder: {local_global_step_folder}")
         actor_local_path = os.path.join(local_global_step_folder, "actor")
 
         actor_remote_path = (
@@ -659,7 +658,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         remove_previous_ckpt_in_save = self.config.trainer.get("remove_previous_ckpt_in_save", False)
         if remove_previous_ckpt_in_save:
             print(
-                "[FullyAsyncTrainer] Warning: remove_previous_ckpt_in_save is deprecated,"
+                "[DecoupledTrainer] Warning: remove_previous_ckpt_in_save is deprecated,"
                 + " set max_actor_ckpt_to_keep=1 and max_critic_ckpt_to_keep=1 instead"
             )
         max_actor_ckpt_to_keep = (
@@ -724,16 +723,16 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 if not os.path.isabs(global_step_folder):
                     working_dir = os.getcwd()
                     global_step_folder = os.path.join(working_dir, global_step_folder)
-        print(f"[FullyAsyncTrainer] Load from checkpoint folder: {global_step_folder}")
+        print(f"[DecoupledTrainer] Load from checkpoint folder: {global_step_folder}")
         # set global step
         self.current_param_version = int(global_step_folder.split("global_step_")[-1])
         self.global_steps = self.current_param_version * self.trigger_parameter_sync_step + 1
         self.last_ckpt_version = self.current_param_version
         print(
-            f"[FullyAsyncTrainer] Setting global step to {self.global_steps}, "
+            f"[DecoupledTrainer] Setting global step to {self.global_steps}, "
             f"current_param_version to {self.current_param_version}"
         )
-        print(f"[FullyAsyncTrainer] Resuming from  {global_step_folder}")
+        print(f"[DecoupledTrainer] Resuming from  {global_step_folder}")
 
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, str(Role.Critic))
@@ -763,10 +762,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.stale_trajectory_processed += stale_traj_count
             metrics.update(
                 {
-                    "fully_async/count/stale_trajectory_processed": self.stale_trajectory_processed,
-                    "fully_async/count/current_param_version": self.current_param_version,
+                    "decoupled/count/stale_trajectory_processed": self.stale_trajectory_processed,
+                    "decoupled/count/current_param_version": self.current_param_version,
                 }
             )
             for key, value in batch.meta_info.items():
-                if key.startswith("fully_async") or key.startswith("timing_s"):
+                if key.startswith("decoupled") or key.startswith("timing_s"):
                     metrics[key] = value
