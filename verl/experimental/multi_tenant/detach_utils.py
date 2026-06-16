@@ -23,6 +23,110 @@ import torch
 from verl import DataProto
 from verl.trainer.ppo.ray_trainer import compute_response_mask
 
+_SYSTEM_METRIC_PREFIXES = (
+    "timing_s/",
+    "timing_per_token_ms/",
+    "perf/",
+    # Rollouter-level stats from get_statistics() — these describe the shared
+    # rollouter state across all tenants and should not be attributed to any
+    # single tenant.
+    "decoupled/monitor/",
+    "decoupled/static/",
+    "decoupled/count/staleness_",
+    "decoupled/count/total_generated_samples",
+    "decoupled/count/dropped_stale_samples",
+)
+_SYSTEM_METRIC_EXACT = {"decoupled/total_wait_time"}
+
+
+def is_system_metric(key: str) -> bool:
+    """Returns True for timing/perf metrics that should be logged per-step (system-level)."""
+    return any(key.startswith(p) for p in _SYSTEM_METRIC_PREFIXES) or key in _SYSTEM_METRIC_EXACT
+
+
+@dataclass
+class TenantConfig:
+    """Configuration for a single tenant in multi-tenant training"""
+
+    name: str
+    train_file: str
+    val_file: str
+    lora_int_id: int  # unique per tenant for vLLM multi-LoRA
+    learning_rate: float | None = None  # per-tenant LR override; None = use config default
+    max_response_length: int | None = None  # per-tenant generation length; None = use config default
+
+
+def parse_tenants(tenants_cfg) -> list[TenantConfig]:
+    """Parse tenant configuration from either a YAML list or a legacy colon-string.
+
+    YAML list format (preferred, via Hydra config group +multi_tenant=<name>):
+        tenants:
+          - name: alice
+            train_file: /data/alice_train.parquet
+            val_file: /data/alice_val.parquet
+            learning_rate: 1e-5          # optional
+            max_response_length: 4096    # optional
+
+    Legacy string format (backward-compatible, via TENANTS env var):
+        'name:train_file:val_file[:lr[:max_response_length]],...'
+
+    Each tenant gets a unique lora_int_id starting from 1.
+    """
+    if isinstance(tenants_cfg, str):
+        return _parse_tenants_str(tenants_cfg)
+    return _parse_tenants_list(tenants_cfg)
+
+
+def _parse_tenants_str(tenants_str: str) -> list[TenantConfig]:
+    """Parse legacy colon-delimited tenant string."""
+    tenants = []
+    for i, entry in enumerate(tenants_str.split(",")):
+        parts = entry.strip().split(":")
+        if len(parts) not in (3, 4, 5):
+            raise ValueError(
+                f"Invalid tenant entry '{entry}'. Expected 'name:train_file:val_file[:lr[:max_response_length]]'"
+            )
+        lr = float(parts[3]) if len(parts) >= 4 and parts[3] else None
+        max_resp_len = int(parts[4]) if len(parts) == 5 and parts[4] else None
+        tenants.append(
+            TenantConfig(
+                name=parts[0],
+                train_file=parts[1],
+                val_file=parts[2],
+                lora_int_id=i + 1,
+                learning_rate=lr,
+                max_response_length=max_resp_len,
+            )
+        )
+    return tenants
+
+
+def _parse_tenants_list(tenants_list) -> list[TenantConfig]:
+    """Parse a list of tenant dicts (from a Hydra YAML config group)."""
+    tenants = []
+    for i, entry in enumerate(tenants_list):
+        if isinstance(entry, dict):
+            d = entry
+        else:
+            from omegaconf import OmegaConf
+
+            d = OmegaConf.to_container(entry, resolve=True)
+        required = {"name", "train_file", "val_file"}
+        missing = required - d.keys()
+        if missing:
+            raise ValueError(f"Tenant entry {i} missing required fields: {missing}")
+        tenants.append(
+            TenantConfig(
+                name=d["name"],
+                train_file=d["train_file"],
+                val_file=d["val_file"],
+                lora_int_id=i + 1,
+                learning_rate=d.get("learning_rate"),
+                max_response_length=d.get("max_response_length"),
+            )
+        )
+    return tenants
+
 
 @dataclass
 class RolloutSample:
@@ -37,6 +141,9 @@ class RolloutSample:
 
     # Processing metadata
     rollout_status: dict[str, Any]
+
+    # Multi-tenant: which tenant this sample belongs to (None for single-tenant)
+    tenant_id: str | None = None
 
 
 @dataclass
@@ -120,7 +227,7 @@ def assemble_batch_from_rollout_samples(
     rollout_samples_batch = []
     rollout_status = rollout_samples[0].rollout_status
     # Add a prefix to all rollout_status keys
-    rollout_status = {f"fully_async/{key}": value for key, value in rollout_status.items()}
+    rollout_status = {f"decoupled/{key}": value for key, value in rollout_status.items()}
 
     for rs in rollout_samples:
         batch = addition_process(rs.full_batch)
@@ -156,16 +263,16 @@ def assemble_batch_from_rollout_samples(
             "timing_s/agent_loop/tool_calls/min": np.min(tool_calls),
             "timing_s/agent_loop/tool_calls/mean": np.mean(tool_calls),
         }
-    processing_time_stats = {f"fully_async/{key}": value for key, value in processing_time_stats.items()}
+    processing_time_stats = {f"decoupled/{key}": value for key, value in processing_time_stats.items()}
 
     param_version_start = final_batch.non_tensor_batch["min_global_steps"]
     param_version_end = final_batch.non_tensor_batch["max_global_steps"]
     param_version_diff = [abs(a - b) for a, b in zip(param_version_end, param_version_start, strict=False)]
     num_diff0 = param_version_diff.count(0)
     partial_stats = {
-        "fully_async/partial/total_partial_num": len(param_version_diff) - num_diff0,
-        "fully_async/partial/partial_ratio": (len(param_version_diff) - num_diff0) / len(param_version_diff),
-        "fully_async/partial/max_partial_span": max(param_version_diff),
+        "decoupled/partial/total_partial_num": len(param_version_diff) - num_diff0,
+        "decoupled/partial/partial_ratio": (len(param_version_diff) - num_diff0) / len(param_version_diff),
+        "decoupled/partial/max_partial_span": max(param_version_diff),
     }
     # add meta_info
     trajectory_param_versions = final_batch.non_tensor_batch["max_global_steps"]
@@ -213,11 +320,11 @@ class MetricsAggregator:
             "avg": ["timing_s/agent_loop/tool_calls/mean"],
             "max": ["timing_s/agent_loop/tool_calls/max"],
             "last": [
-                "fully_async/count/total_generated_samples",
-                "fully_async/count/stale_samples_processed",
-                "fully_async/count/stale_trajectory_processed",
-                "fully_async/count/current_param_version",
-                "fully_async/count/dropped_stale_samples",
+                "decoupled/count/total_generated_samples",
+                "decoupled/count/stale_samples_processed",
+                "decoupled/count/stale_trajectory_processed",
+                "decoupled/count/current_param_version",
+                "decoupled/count/dropped_stale_samples",
                 "training/global_step",  # TODO change name to: total_step
             ],
         }
@@ -334,7 +441,7 @@ class MetricsAggregator:
 
         # trainer/idle_ratio
         if "timing_s/gen" in aggregated.keys() and "timing_s/step" in aggregated.keys():
-            aggregated["fully_async/trainer/idle_ratio"] = aggregated["timing_s/gen"] / aggregated["timing_s/step"]
+            aggregated["decoupled/trainer/idle_ratio"] = aggregated["timing_s/gen"] / aggregated["timing_s/step"]
 
         return aggregated
 

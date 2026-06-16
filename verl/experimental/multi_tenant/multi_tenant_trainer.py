@@ -1,4 +1,4 @@
-"""Multi-tenant trainer that extends FullyAsyncTrainer.
+"""Multi-tenant trainer that extends DecoupledTrainerBase.
 
 Polls per-tenant MessageQueues, trains whichever tenant is ready first,
 swaps LoRA adapter weights between tenants, and syncs per-tenant adapters
@@ -14,16 +14,15 @@ from typing import Any
 
 import numpy as np
 import ray
-from omegaconf import OmegaConf
 
-from verl.experimental.fully_async_policy.detach_utils import (
+from verl.experimental.multi_tenant.base_trainer import DecoupledTrainerBase
+from verl.experimental.multi_tenant.detach_utils import (
     TenantConfig,
     ValidateMetrics,
     assemble_batch_from_rollout_samples,
     is_system_metric,
 )
-from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainerBase, TrainingStopException
-from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
+from verl.experimental.multi_tenant.message_queue import MessageQueueClient
 from verl.single_controller.ray import RayWorkerGroup
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role, WorkerType
@@ -36,7 +35,7 @@ _TENANT_VERSION_BASE = 100000
 
 
 @ray.remote(num_cpus=10)
-class MultiTenantTrainer(FullyAsyncTrainerBase):
+class MultiTenantTrainer(DecoupledTrainerBase):
     """Multi-tenant trainer: polls per-tenant queues, swaps adapters, per-tenant weight sync."""
 
     def __init__(
@@ -87,7 +86,7 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
 
         # Per-tenant aggregators for data metrics (losses, scores, staleness, etc.)
         # The parent's self.metrics_aggregator is no longer used in multi-tenant mode.
-        from verl.experimental.fully_async_policy.detach_utils import MetricsAggregator
+        from verl.experimental.multi_tenant.detach_utils import MetricsAggregator
 
         self._total_gpus = (
             config.trainer.nnodes * config.trainer.n_gpus_per_node
@@ -221,8 +220,7 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
                 if queue_size >= self.required_samples:
                     # This tenant has enough samples — collect them
                     print(
-                        f"[MTTrainer] Tenant '{tc.name}' ready with {queue_size} samples "
-                        f"(need {self.required_samples})"
+                        f"[MTTrainer] Tenant '{tc.name}' ready with {queue_size} samples (need {self.required_samples})"
                     )
 
                     # Switch to this tenant's adapter
@@ -254,12 +252,10 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
                             queue_samples, self.tokenizer, self.config, self._balance_batch
                         )
                     else:
-                        batch = assemble_batch_from_rollout_samples(
-                            queue_samples, self.tokenizer, self.config, None
-                        )
+                        batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
 
-                    batch.meta_info["fully_async/total_wait_time"] = total_wait_time
-                    batch.meta_info["fully_async/active_tenant"] = tc.name
+                    batch.meta_info["decoupled/total_wait_time"] = total_wait_time
+                    batch.meta_info["decoupled/active_tenant"] = tc.name
                     return 0, batch
 
             # No tenant ready yet, brief sleep before retrying
@@ -330,7 +326,7 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
 
         Called once at startup after the base model is synced. Each tenant gets the
         same initial adapter weights (the model's initial LoRA state).
-        """ 
+        """
         # Also initialize per-tenant model states on CPU
         self._init_tenant_model_states()
 
@@ -373,7 +369,7 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
 
         time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         print(
-            f"[FullyAsyncTrainer][tenant={tenant_name}] global_steps: {self.global_steps} "
+            f"[DecoupledTrainer][tenant={tenant_name}] global_steps: {self.global_steps} "
             f"local_trigger_step: {self.local_trigger_step} "
             f"trigger_parameter_sync_step: {self.trigger_parameter_sync_step} "
             f"{time_str}"
@@ -401,7 +397,7 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         system_metrics = {}
         tenant_data_metrics = {}
         for key, value in self.metrics.items():
-            if not isinstance(value, (int, float, np.number)):
+            if not isinstance(value, int | float | np.number):
                 continue  # skip string metrics like active_tenant
             if is_system_metric(key):
                 system_metrics[key] = value
@@ -412,9 +408,7 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         if "timing_s/gen" in system_metrics and "timing_s/step" in system_metrics:
             step_time = system_metrics["timing_s/step"]
             if step_time > 0:
-                system_metrics["fully_async/trainer/idle_ratio"] = (
-                    system_metrics["timing_s/gen"] / step_time
-                )
+                system_metrics["decoupled/trainer/idle_ratio"] = system_metrics["timing_s/gen"] / step_time
 
         # Recompute throughput against full (trainer + rollout) GPU count, mirroring
         # MetricsAggregator._special_metrics_aggergate. compute_throughout_metrics uses
@@ -423,9 +417,7 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
         if {"perf/throughput", "perf/total_num_tokens", "perf/time_per_step"}.issubset(system_metrics):
             t = system_metrics["perf/time_per_step"]
             if t > 0:
-                system_metrics["perf/throughput"] = system_metrics["perf/total_num_tokens"] / (
-                    t * self._total_gpus
-                )
+                system_metrics["perf/throughput"] = system_metrics["perf/total_num_tokens"] / (t * self._total_gpus)
 
         # Log system timing metrics immediately (every step, no aggregation)
         self.logger.log(data=system_metrics, step=self.total_fit_steps)
@@ -472,25 +464,21 @@ class MultiTenantTrainer(FullyAsyncTrainerBase):
                 new_metrics = self._merge_validation_results(train_val_metrics, val_metrics.metrics)
             if new_metrics:
                 self.logger.log(data=new_metrics, step=self.total_fit_steps)
-                pprint(
-                    f"[MTTrainer][validation] total_fit_steps={self.total_fit_steps} metrics={new_metrics}"
-                )
+                pprint(f"[MTTrainer][validation] total_fit_steps={self.total_fit_steps} metrics={new_metrics}")
         else:
             if val_metrics.metrics:
                 self.logger.log(data=val_metrics.metrics, step=self.total_fit_steps)
-                pprint(
-                    f"[MTTrainer][validation] total_fit_steps={self.total_fit_steps} metrics={val_metrics.metrics}"
-                )
+                pprint(f"[MTTrainer][validation] total_fit_steps={self.total_fit_steps} metrics={val_metrics.metrics}")
         self.logger.log(data=val_metrics.timing_raw, step=self.total_fit_steps)
 
     def _collect_metrics_from_samples(self, batch, metrics):
         """Override: add tenant info to metrics."""
         super()._collect_metrics_from_samples(batch, metrics)
         if hasattr(batch, "meta_info") and batch.meta_info:
-            tenant_name = batch.meta_info.get("fully_async/active_tenant")
+            tenant_name = batch.meta_info.get("decoupled/active_tenant")
             if tenant_name:
-                metrics["fully_async/active_tenant"] = tenant_name
-                metrics["fully_async/active_tenant_lora_id"] = self.tenant_lora_map.get(tenant_name, -1)
+                metrics["decoupled/active_tenant"] = tenant_name
+                metrics["decoupled/active_tenant_lora_id"] = self.tenant_lora_map.get(tenant_name, -1)
 
     def _save_checkpoint(self):
         """Override: save per-tenant checkpoints."""

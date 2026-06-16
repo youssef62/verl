@@ -14,11 +14,11 @@ async_training:
   # Maximum samples staleness threshold
   staleness_threshold: 0.1
 
-  # Frequency of parameter synchronization between rollouter and trainer, 
+  # Frequency of parameter synchronization between rollouter and trainer,
   # One step means trainer obtains a batch of required samples
   trigger_parameter_sync_step: 4
-  
-  # The number of ppo_mini_batches that the FullyAsyncTrainer obtains once
+
+  # The number of ppo_mini_batches that the decoupled trainer obtains once
   require_batches: 1
 
   # When synchronizing parameters, Whether to resume generation when rollout is interrupted.
@@ -28,13 +28,37 @@ async_training:
   # whether to use trainer do_validate
   use_trainer_do_validate: False
 
+  # Max in-flight generations per vLLM server handle. Controls backpressure.
+  # In multi-tenant mode the effective limit is this value * num_tenants.
+  max_concurrent_samples_per_replica: 16
+
+# Multi-tenant config. Each tenant is a LoRA adapter over the shared base model.
+# Provide tenants either inline (the `tenants` list), via a YAML file (`config_path`),
+# or override on the command line (e.g. `+multi_tenant.tenants='alice:train.parquet:val.parquet:1e-5,...'`).
+multi_tenant:
+
+  # Inline list of tenant configs. Each entry:
+  #   - name: <tenant name>
+  #     train_file: <path to train parquet>
+  #     val_file: <path to val parquet>
+  #     learning_rate: <optional per-tenant LR override>
+  #     max_response_length: <optional per-tenant generation length>
+  tenants: null
+
+  # Path to a YAML file containing a top-level `tenants:` list (alternative to inline `tenants`).
+  config_path: null
+
+  # Scheduling policy for the multi-tenant rollouter:
+  #   round_robin (interleave tenants) or burst (fill one tenant at a time).
+  scheduling: round_robin
+
 # Rollout config
 rollout:
 
   # Number of nodes used in the rollout
   nnodes: 1
 
-  # Number of GPUs per node                     
+  # Number of GPUs per node
   n_gpus_per_node: 8
 
   # number of responses (i.e. num sample times). > 1 for grpo
